@@ -37,6 +37,7 @@ from mudae.ouro.Oq_solver import (
     OBS_ORANGE,
     OBS_PURPLE,
 )
+from mudae.web.bridge import emit_log, emit_runner_event
 
 try:
     import discum  # type: ignore[import]
@@ -83,6 +84,7 @@ class OqCell:
 def _make_emitter(quiet: bool):
     if not quiet:
         def _emit(message: str, level: str = "INFO") -> None:
+            emit_log(message, level, source="Oq_bot")
             print(message)
         return _emit
     try:
@@ -93,6 +95,7 @@ def _make_emitter(quiet: bool):
         return _emit
 
     def _emit(message: str, level: str = "INFO") -> None:
+        emit_log(message, level, source="Oq_bot")
         if level == "WARN":
             log_warn(message)
         elif level == "ERROR":
@@ -158,6 +161,7 @@ def _log_event(entry: Dict[str, Any]) -> None:
     payload = dict(entry)
     payload["ts"] = _timestamp()
     append_json_array(LOG_FILE, payload)
+    emit_runner_event("Oq_bot", payload)
 
 
 def _select_user() -> Dict[str, str]:

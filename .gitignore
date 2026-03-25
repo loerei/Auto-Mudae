@@ -23,6 +23,12 @@ config/*.json
 logs/*
 !logs/.gitkeep
 
+.cache
+webui/node_modules/
+webui/dist/
+*.db
+*.sqlite3
+
 
 .fake
 .env

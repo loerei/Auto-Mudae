@@ -24,6 +24,7 @@ from mudae.storage.latency_metrics import record_event as record_latency_event
 from mudae.ouro import Oc_interactive_solver as oc_solver
 from mudae.ouro.Oc_interactive_solver import InteractiveSolver, SphereColor
 from mudae.ouro.sphere_reward_parse import parse_reward_message
+from mudae.web.bridge import emit_log, emit_runner_event
 
 try:
     import discum  # type: ignore[import]
@@ -50,6 +51,7 @@ ACTION_LEASE_HEARTBEAT_SEC = 20.0
 def _make_emitter(quiet: bool):
     if not quiet:
         def _emit(message: str, level: str = "INFO") -> None:
+            emit_log(message, level, source="Oc_bot")
             print(message)
         return _emit
     try:
@@ -60,6 +62,7 @@ def _make_emitter(quiet: bool):
         return _emit
 
     def _emit(message: str, level: str = "INFO") -> None:
+        emit_log(message, level, source="Oc_bot")
         if level == "WARN":
             log_warn(message)
         elif level == "ERROR":
@@ -135,6 +138,7 @@ def _log_event(entry: Dict[str, Any]) -> None:
     payload = dict(entry)
     payload["ts"] = _timestamp()
     append_json_array(LOG_FILE, payload)
+    emit_runner_event("Oc_bot", payload)
 
 
 def _acquire_action_lease(token: str, user_name: str):

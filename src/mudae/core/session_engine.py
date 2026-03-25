@@ -31,6 +31,7 @@ from mudae.storage.coordination import acquire_lease, build_identity_scope, buil
 from mudae.storage.json_array_log import append_json_array, ensure_json_array_file, iter_json_array
 from mudae.storage.latency_metrics import record_event as record_latency_event
 from mudae.paths import PROJECT_ROOT, LOGS_DIR, CONFIG_DIR, ensure_runtime_dirs
+from mudae.web.bridge import emit_log, emit_state
 
 # Fix encoding for Windows console to support emojis
 try:
@@ -619,6 +620,7 @@ def log(message: str, level: Optional[str] = None) -> None:
             _dashboard_state['last_message'] = err_msg
         else:
             print(err_msg)
+    emit_log(message, level_norm or 'INFO', plain=plain_formatted)
 
 
 def log_debug(message: str) -> None:
@@ -1689,14 +1691,16 @@ def _dashboard_reset_roll_state(session_start: Optional[str] = None) -> None:
     _dashboard_state['last_status_line_len'] = 0
 
 def _dashboard_set_status(status: Optional[Dict[str, Any]]) -> None:
-    if not DASHBOARD_ENABLED or not status:
+    if not status:
         return
     _dashboard_state['status'] = status
+    emit_state("session_status", status)
 
 def _dashboard_set_wishlist(wishlist: Optional[Dict[str, Any]]) -> None:
-    if not DASHBOARD_ENABLED or not wishlist:
+    if not wishlist:
         return
     _dashboard_state['wishlist'] = wishlist
+    emit_state("wishlist", wishlist)
 
 def _dashboard_add_roll(entry: Dict[str, Any]) -> None:
     if not DASHBOARD_ENABLED:
@@ -1721,33 +1725,30 @@ def _dashboard_mark_last_roll(key: str, value: Any) -> None:
     rolls[-1][key] = value
 
 def _dashboard_set_roll_progress(remaining: Optional[int], target: Optional[int]) -> None:
-    if not DASHBOARD_ENABLED:
-        return
     _dashboard_state['rolls_remaining'] = remaining
     if target is not None:
         _dashboard_state['rolls_target'] = target
+    emit_state("roll_progress", {"remaining": remaining, "target": target})
 
 def _dashboard_set_best_candidate(candidate: Optional[Dict[str, Any]]) -> None:
-    if not DASHBOARD_ENABLED:
-        return
     _dashboard_state['best_candidate'] = candidate
+    emit_state("best_candidate", candidate)
 
 def _dashboard_set_summary(summary: Dict[str, Any]) -> None:
-    if not DASHBOARD_ENABLED:
-        return
     _dashboard_state['summary'] = summary
+    emit_state("summary", summary)
 
 def _dashboard_set_predicted(status: str, minutes_to_wait: int) -> None:
-    if not DASHBOARD_ENABLED:
-        return
     next_time = time.localtime(time.time() + minutes_to_wait * 60)
     _dashboard_state['predicted_at'] = time.strftime("%H:%M", next_time)
     _dashboard_state['predicted_status'] = status
+    emit_state("predicted", {"status": status, "minutes_to_wait": minutes_to_wait, "predicted_at": _dashboard_state['predicted_at']})
 
 def setConnectionStatus(status: str) -> None:
+    _dashboard_state['connection_status'] = status
+    emit_state("connection_status", {"status": status})
     if not DASHBOARD_ENABLED:
         return
-    _dashboard_state['connection_status'] = status
     render_dashboard()
 
 def startConnectionRetry(seconds_remaining: int) -> None:
@@ -1771,37 +1772,57 @@ def stopConnectionRetry() -> None:
     render_dashboard()
 
 def setDashboardState(state: str, last_action: Optional[str] = None, next_action: Optional[str] = None) -> None:
-    if not DASHBOARD_ENABLED:
-        return
     _dashboard_state['state'] = state
     if last_action is not None:
         _dashboard_state['last_action'] = last_action
     if next_action is not None:
         _dashboard_state['next_action'] = next_action
+    emit_state(
+        "dashboard_state",
+        {
+            "state": state,
+            "last_action": _dashboard_state.get('last_action'),
+            "next_action": _dashboard_state.get('next_action'),
+        },
+    )
+    if not DASHBOARD_ENABLED:
+        return
     render_dashboard()
 
 def startDashboardCountdown(status: Optional[Dict[str, Any]], total_seconds: int) -> None:
-    if not DASHBOARD_ENABLED or not status or total_seconds <= 0:
+    if not status or total_seconds <= 0:
         return
     _dashboard_state['countdown_active'] = True
     _dashboard_state['countdown_total'] = total_seconds
     _dashboard_state['countdown_remaining'] = total_seconds
     _dashboard_state['countdown_status'] = status.copy()
+    emit_state("countdown", {"active": True, "remaining": total_seconds, "total": total_seconds})
+    if not DASHBOARD_ENABLED:
+        return
     render_dashboard()
 
 def updateDashboardCountdown(seconds_remaining: int) -> None:
-    if not DASHBOARD_ENABLED or not _dashboard_state.get('countdown_active'):
+    if not _dashboard_state.get('countdown_active'):
         return
     _dashboard_state['countdown_remaining'] = max(0, seconds_remaining)
+    emit_state(
+        "countdown",
+        {
+            "active": True,
+            "remaining": _dashboard_state['countdown_remaining'],
+            "total": _dashboard_state.get('countdown_total'),
+        },
+    )
+    if not DASHBOARD_ENABLED:
+        return
     render_dashboard()
 
 def stopDashboardCountdown() -> None:
-    if not DASHBOARD_ENABLED:
-        return
     _dashboard_state['countdown_active'] = False
     _dashboard_state['countdown_total'] = 0
     _dashboard_state['countdown_remaining'] = 0
     _dashboard_state['countdown_status'] = None
+    emit_state("countdown", {"active": False, "remaining": 0, "total": 0})
 
 def _dashboard_console_viewport_size() -> Optional[Tuple[int, int]]:
     """Return visible console viewport size (cols, rows) when available."""
@@ -3779,9 +3800,19 @@ def matchesWishlist(cardName: str, cardSeries: str, mudae_star_wishes: Optional[
         if wish_matches(cardName, wish) or wish_matches(cardSeries, wish):
             return (True, 2)
     
-    for item in cast(List[str], Vars.wishlist):
-        if wish_matches(cardName, item) or wish_matches(cardSeries, item):
-            return (True, 2)
+    for item in cast(List[Any], Vars.wishlist):
+        priority = 2
+        wish_value = item
+        if isinstance(item, dict):
+            wish_value = item.get('name') or item.get('value') or ''
+            try:
+                priority = int(item.get('priority') or 2)
+            except (TypeError, ValueError):
+                priority = 2
+            if bool(item.get('is_star') or item.get('star')):
+                priority = max(priority, 3)
+        if wish_matches(cardName, str(wish_value)) or wish_matches(cardSeries, str(wish_value)):
+            return (True, max(1, priority))
     
     return (False, 1)
 

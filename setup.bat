@@ -133,36 +133,16 @@ if defined PYTHONPATH (
 
 echo.
 echo [setup] Setup complete.
-choice /c 1234 /m "Run: [1] Bot  [2] $oh  [3] $oc  [4] Exit"
-if errorlevel 4 goto :done
-if errorlevel 3 goto :run_oc
-if errorlevel 2 goto :run_oh
-if errorlevel 1 goto :run_bot
+choice /c 12 /m "Run: [1] WebUI  [2] Exit"
+if errorlevel 2 goto :done
+if errorlevel 1 goto :run_webui
 
-:run_bot
-if exist "run_bot.bat" (
-    call "run_bot.bat"
+:run_webui
+if exist "run_webui.bat" (
+    call "run_webui.bat"
 ) else (
-    echo [warn] run_bot.bat not found. Launching mudae.cli.bot directly.
-    "!PYTHON!" -m mudae.cli.bot
-)
-goto :done
-
-:run_oh
-if exist "run_oh.bat" (
-    call "run_oh.bat"
-) else (
-    echo [warn] run_oh.bat not found. Launching mudae.cli.oh directly.
-    "!PYTHON!" -m mudae.cli.oh
-)
-goto :done
-
-:run_oc
-if exist "run_oc.bat" (
-    call "run_oc.bat"
-) else (
-    echo [warn] run_oc.bat not found. Launching mudae.cli.oc directly.
-    "!PYTHON!" -m mudae.cli.oc
+    echo [warn] run_webui.bat not found. Launching mudae.web.server directly.
+    "!PYTHON!" -m mudae.web.server
 )
 goto :done
 
