@@ -61,6 +61,7 @@ class WorkerHandle:
     process: subprocess.Popen[str]
     queue_item_id: Optional[int] = None
     pause_after_exit: bool = False
+    forced_stop: bool = False
 
 
 class WebSupervisor:
@@ -167,6 +168,38 @@ class WebSupervisor:
             return self._update_state(account_id, {"status": "stopping"})
         return self._update_state(account_id, {"status": "stopped", "active_mode": None, "active_session_id": None})
 
+    def force_stop_account(self, account_id: int, *, clear_queue: bool = True) -> Dict[str, Any]:
+        cleared = self.db.clear_queue(account_id=account_id) if clear_queue else 0
+        with self._lock:
+            handle = self._workers.get(account_id)
+        if handle and handle.process.poll() is None:
+            handle.forced_stop = True
+            handle.pause_after_exit = False
+            handle.process.terminate()
+            return self._update_state(
+                account_id,
+                {
+                    "status": "stopping",
+                    "queue": self.db.list_queue(account_id=account_id, status="pending"),
+                    "last_message": f"Force stop requested{f'; cleared {cleared} queue item(s)' if cleared else ''}",
+                },
+            )
+        return self._update_state(
+            account_id,
+            {
+                "status": "stopped",
+                "active_mode": None,
+                "active_session_id": None,
+                "queue": self.db.list_queue(account_id=account_id, status="pending"),
+                "last_message": f"Force stop complete{f'; cleared {cleared} queue item(s)' if cleared else ''}",
+            },
+        )
+
+    def clear_queue(self, account_id: int) -> Dict[str, Any]:
+        cleared = self.db.clear_queue(account_id=account_id)
+        snapshot = self._update_state(account_id, {"queue": self.db.list_queue(account_id=account_id, status="pending")})
+        return {"cleared": cleared, "snapshot": snapshot}
+
     def pause_account(self, account_id: int) -> Dict[str, Any]:
         with self._lock:
             handle = self._workers.get(account_id)
@@ -228,7 +261,7 @@ class WebSupervisor:
         env["PYTHONIOENCODING"] = "utf-8"
         env["PYTHONDONTWRITEBYTECODE"] = "1"
 
-        self.db.create_session(
+        session = self.db.create_session(
             session_id=session_id,
             account_id=account_id,
             mode=mode,
@@ -268,6 +301,7 @@ class WebSupervisor:
                 "active_session_id": session_id,
                 "last_mode": mode,
                 "pid": process.pid,
+                "session_started_at": session.get("started_at"),
                 "paused_mode": None,
                 "last_error": None,
                 "queue": self.db.list_queue(account_id=account_id, status="pending"),
@@ -372,10 +406,35 @@ class WebSupervisor:
         elif state_type == "countdown" and isinstance(value, dict):
             patch["countdown_active"] = bool(value.get("active"))
             patch["countdown_remaining"] = value.get("remaining")
+        elif state_type == "connection_retry" and isinstance(value, dict):
+            patch["connection_retry_active"] = bool(value.get("active"))
+            patch["connection_retry_sec"] = value.get("remaining")
+        elif state_type == "session_meta" and isinstance(value, dict):
+            patch["session_start"] = value.get("session_start")
+            patch["session_start_ts"] = value.get("session_start_ts")
         elif state_type == "session_status":
             patch["session_status"] = value
+            if isinstance(value, dict):
+                for key in (
+                    "oh_left",
+                    "oc_left",
+                    "oq_left",
+                    "oh_stored",
+                    "oc_stored",
+                    "oq_stored",
+                    "sphere_balance",
+                    "ouro_refill_min",
+                ):
+                    patch[key] = value.get(key)
         elif state_type == "wishlist":
             patch["wishlist_state"] = value
+        elif state_type == "rolls" and isinstance(value, dict):
+            patch["rolls"] = value.get("items") or []
+            patch["rolls_total"] = value.get("total")
+            patch["rolls_target"] = value.get("target")
+            patch["rolls_remaining"] = value.get("remaining")
+        elif state_type == "others_rolls" and isinstance(value, dict):
+            patch["others_rolls"] = value.get("items") or []
         elif state_type == "roll_progress":
             patch["roll_progress"] = value
         elif state_type == "best_candidate":
@@ -399,10 +458,16 @@ class WebSupervisor:
                 self._workers.pop(handle.account_id, None)
 
         if handle.queue_item_id is not None:
-            final_queue_status = "completed" if return_code in (0, 20, 30) else "failed"
+            if handle.forced_stop:
+                final_queue_status = "cancelled"
+            else:
+                final_queue_status = "completed" if return_code in (0, 20, 30) else "failed"
             self.db.update_queue_item(handle.queue_item_id, status=final_queue_status, session_id=handle.session_id)
 
-        if return_code == 20 or handle.pause_after_exit:
+        if handle.forced_stop:
+            status = "stopped"
+            error = None
+        elif return_code == 20 or handle.pause_after_exit:
             status = "paused"
             error = None
         elif return_code == 30:
@@ -420,6 +485,9 @@ class WebSupervisor:
             "status": status,
             "active_session_id": None,
             "pid": None,
+            "session_started_at": None,
+            "connection_retry_active": False,
+            "connection_retry_sec": 0,
             "queue": self.db.list_queue(account_id=handle.account_id, status="pending"),
         }
         if status == "paused":
@@ -509,6 +577,29 @@ class WebSupervisor:
             "next_action": None,
             "countdown_active": False,
             "countdown_remaining": None,
+            "connection_retry_active": False,
+            "connection_retry_sec": 0,
+            "session_start": None,
+            "session_start_ts": None,
+            "session_started_at": None,
+            "session_status": {},
+            "wishlist_state": {},
+            "rolls": [],
+            "rolls_total": 0,
+            "rolls_target": None,
+            "rolls_remaining": None,
+            "others_rolls": [],
+            "predicted": {},
+            "best_candidate": None,
+            "summary": {},
+            "oh_left": None,
+            "oc_left": None,
+            "oq_left": None,
+            "oh_stored": None,
+            "oc_stored": None,
+            "oq_stored": None,
+            "sphere_balance": None,
+            "ouro_refill_min": None,
             "last_message": None,
             "last_error": None,
             "pid": None,

@@ -1624,9 +1624,47 @@ def _dashboard_runtime_str(start_ts: Optional[float]) -> str:
     elapsed = max(0, int(time.time() - start_ts))
     return formatTimeHrsMinSec(elapsed)
 
+
+def _dashboard_emit_session_meta() -> None:
+    emit_state(
+        "session_meta",
+        {
+            "session_start": _dashboard_state.get("session_start"),
+            "session_start_ts": _dashboard_state.get("session_start_ts"),
+            "program_start": _dashboard_state.get("program_start"),
+            "program_start_ts": _dashboard_state.get("program_start_ts"),
+        },
+    )
+
+
+def _dashboard_emit_rolls() -> None:
+    rolls = _dashboard_state.get("rolls", [])
+    emit_state(
+        "rolls",
+        {
+            "items": [dict(item) for item in rolls],
+            "total": int(_dashboard_state.get("rolls_total") or len(rolls)),
+            "target": _dashboard_state.get("rolls_target"),
+            "remaining": _dashboard_state.get("rolls_remaining"),
+        },
+    )
+
+
+def _dashboard_emit_other_rolls() -> None:
+    others = _dashboard_state.get("others_rolls", [])
+    emit_state("others_rolls", {"items": [dict(item) for item in others]})
+
+
+def _dashboard_emit_connection_retry() -> None:
+    emit_state(
+        "connection_retry",
+        {
+            "active": bool(_dashboard_state.get("connection_retry_active")),
+            "remaining": int(_dashboard_state.get("connection_retry_sec") or 0),
+        },
+    )
+
 def _dashboard_reset_session(session_start: Optional[str] = None) -> None:
-    if not DASHBOARD_ENABLED:
-        return
     _dashboard_state['session_start'] = session_start or time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())
     _dashboard_state['session_start_ts'] = time.time()
     if not _dashboard_state.get('program_start_ts'):
@@ -1663,10 +1701,20 @@ def _dashboard_reset_session(session_start: Optional[str] = None) -> None:
     _dashboard_state['renderer_mode'] = None
     _dashboard_state['last_status_line_at'] = 0.0
     _dashboard_state['last_status_line_len'] = 0
+    _dashboard_emit_session_meta()
+    emit_state("session_status", {})
+    emit_state("wishlist", {})
+    _dashboard_emit_rolls()
+    _dashboard_emit_other_rolls()
+    emit_state("best_candidate", None)
+    emit_state("summary", {})
+    emit_state("predicted", {"status": "", "minutes_to_wait": 0, "predicted_at": ""})
+    _dashboard_emit_connection_retry()
+    emit_state("dashboard_state", {"state": _dashboard_state["state"], "last_action": "", "next_action": ""})
+    if DASHBOARD_ENABLED:
+        render_dashboard()
 
 def _dashboard_reset_roll_state(session_start: Optional[str] = None) -> None:
-    if not DASHBOARD_ENABLED:
-        return
     if session_start:
         _dashboard_state['session_start'] = session_start
         _dashboard_state['session_start_ts'] = time.time()
@@ -1689,6 +1737,14 @@ def _dashboard_reset_roll_state(session_start: Optional[str] = None) -> None:
     _dashboard_state['anchor_pos'] = None
     _dashboard_state['last_status_line_at'] = 0.0
     _dashboard_state['last_status_line_len'] = 0
+    _dashboard_emit_session_meta()
+    _dashboard_emit_rolls()
+    emit_state("best_candidate", None)
+    emit_state("summary", {})
+    emit_state("predicted", {"status": "", "minutes_to_wait": 0, "predicted_at": ""})
+    _dashboard_emit_connection_retry()
+    if DASHBOARD_ENABLED:
+        render_dashboard()
 
 def _dashboard_set_status(status: Optional[Dict[str, Any]]) -> None:
     if not status:
@@ -1703,26 +1759,23 @@ def _dashboard_set_wishlist(wishlist: Optional[Dict[str, Any]]) -> None:
     emit_state("wishlist", wishlist)
 
 def _dashboard_add_roll(entry: Dict[str, Any]) -> None:
-    if not DASHBOARD_ENABLED:
-        return
     _dashboard_state['rolls'].append(entry)
     _dashboard_state['rolls_total'] = len(_dashboard_state['rolls'])
+    _dashboard_emit_rolls()
 
 def _dashboard_add_other_roll(entry: Dict[str, Any]) -> None:
-    if not DASHBOARD_ENABLED:
-        return
     others = _dashboard_state.setdefault('others_rolls', [])
     others.append(entry)
     if len(others) > 20:
         del others[:-20]
+    _dashboard_emit_other_rolls()
 
 def _dashboard_mark_last_roll(key: str, value: Any) -> None:
-    if not DASHBOARD_ENABLED:
-        return
     rolls = _dashboard_state.get('rolls')
     if not rolls:
         return
     rolls[-1][key] = value
+    _dashboard_emit_rolls()
 
 def _dashboard_set_roll_progress(remaining: Optional[int], target: Optional[int]) -> None:
     _dashboard_state['rolls_remaining'] = remaining
@@ -1752,24 +1805,26 @@ def setConnectionStatus(status: str) -> None:
     render_dashboard()
 
 def startConnectionRetry(seconds_remaining: int) -> None:
-    if not DASHBOARD_ENABLED:
-        return
     _dashboard_state['connection_retry_active'] = True
     _dashboard_state['connection_retry_sec'] = max(0, int(seconds_remaining))
-    render_dashboard()
+    _dashboard_emit_connection_retry()
+    if DASHBOARD_ENABLED:
+        render_dashboard()
 
 def updateConnectionRetry(seconds_remaining: int) -> None:
-    if not DASHBOARD_ENABLED or not _dashboard_state.get('connection_retry_active'):
+    if not _dashboard_state.get('connection_retry_active'):
         return
     _dashboard_state['connection_retry_sec'] = max(0, int(seconds_remaining))
-    render_dashboard()
+    _dashboard_emit_connection_retry()
+    if DASHBOARD_ENABLED:
+        render_dashboard()
 
 def stopConnectionRetry() -> None:
-    if not DASHBOARD_ENABLED:
-        return
     _dashboard_state['connection_retry_active'] = False
     _dashboard_state['connection_retry_sec'] = 0
-    render_dashboard()
+    _dashboard_emit_connection_retry()
+    if DASHBOARD_ENABLED:
+        render_dashboard()
 
 def setDashboardState(state: str, last_action: Optional[str] = None, next_action: Optional[str] = None) -> None:
     _dashboard_state['state'] = state

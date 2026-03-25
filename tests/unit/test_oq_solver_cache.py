@@ -72,6 +72,42 @@ def test_legacy_pickle_cache_migrates(_isolated_cache_dir):
     assert solver._cache.get((1001, 0, 0, 2)) == pytest.approx(0.11, abs=1e-12)
 
 
+def test_legacy_first_suggestion_cache_migrates_to_policy_specific_path(_isolated_cache_dir):
+    cache_version = oq.OQ_CACHE_VERSION_DEFAULT
+    policy_signature = oq._policy_signature(oq.OQ_POLICY_MODE_BEAM, oq.OQ_BEAM_K_DEFAULT)
+    legacy_path = _isolated_cache_dir / oq.OQ_FIRST_SUGGESTION_FILENAME_TEMPLATE.format(version=cache_version)
+    payload = {
+        "key": oq._first_suggestion_cache_key(oq.MAX_CLICKS, cache_version, policy_signature),
+        "pos": 11,
+    }
+    with open(legacy_path, "wb") as f:
+        pickle.dump(payload, f, protocol=pickle.HIGHEST_PROTOCOL)
+
+    pos = oq._load_first_suggestion(oq.MAX_CLICKS, cache_version, policy_signature)
+    migrated_path = oq._first_suggestion_cache_path(cache_version, policy_signature)
+
+    assert pos == 11
+    assert migrated_path.exists()
+
+
+def test_pick_next_click_uses_fast_opening_when_initial_cache_is_missing(_isolated_cache_dir, monkeypatch):
+    monkeypatch.setattr(oq, "_get_state_cache", lambda **_: object())
+    monkeypatch.setattr(oq, "_load_first_suggestion", lambda *args, **kwargs: None)
+
+    def _unexpected_eval(*args, **kwargs):
+        raise AssertionError("initial root evaluation should not run on a cold cache")
+
+    monkeypatch.setattr(oq, "_beam_candidate_positions", _unexpected_eval)
+
+    solver = oq.OqSolver(
+        max_clicks=oq.MAX_CLICKS,
+        cache_ram_mb=8,
+        cache_version="fast_opening_test_v1",
+    )
+
+    assert solver.pick_next_click() == oq.OQ_FALLBACK_FIRST_CLICK
+
+
 def test_trim_to_first_branch_keeps_root_and_first_bit_states(_isolated_cache_dir):
     max_clicks = 7
     cache_version = "trim_test_v2"

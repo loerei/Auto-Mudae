@@ -5,7 +5,7 @@ import sqlite3
 import threading
 import time
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional
+from typing import Any, Dict, Iterable, List, Optional, Sequence
 
 
 def _dump_json(value: Any) -> str:
@@ -576,6 +576,33 @@ class WebDB:
             self._conn.commit()
         return self.get_queue_item(queue_id)
 
+    def clear_queue(
+        self,
+        *,
+        account_id: Optional[int] = None,
+        statuses: Sequence[str] = ("pending", "starting"),
+        replacement_status: str = "cancelled",
+    ) -> int:
+        active_statuses = [str(status) for status in statuses if str(status).strip()]
+        if not active_statuses:
+            return 0
+        now = time.time()
+        clauses = [f"status IN ({','.join('?' for _ in active_statuses)})"]
+        params: List[Any] = list(active_statuses)
+        if account_id is not None:
+            clauses.append("account_id = ?")
+            params.append(account_id)
+        params = [replacement_status, now, *params]
+        query = f"""
+                UPDATE queue_items
+                SET status = ?, updated_at = ?
+                WHERE {' AND '.join(clauses)}
+                """
+        with self._lock:
+            cursor = self._conn.execute(query, tuple(params))
+            self._conn.commit()
+        return int(cursor.rowcount or 0)
+
     def next_pending_queue_item(self, account_id: int, *, before: Optional[float] = None) -> Optional[Dict[str, Any]]:
         cutoff = before if before is not None else time.time()
         with self._lock:
@@ -710,10 +737,33 @@ class WebDB:
                         "paused_mode": None,
                         "worker_status": None,
                         "connection_status": None,
+                        "connection_retry_active": False,
+                        "connection_retry_sec": 0,
                         "dashboard_state": None,
                         "next_action": None,
                         "countdown_active": False,
                         "countdown_remaining": None,
+                        "session_start": None,
+                        "session_start_ts": None,
+                        "session_started_at": None,
+                        "session_status": {},
+                        "wishlist_state": {},
+                        "rolls": [],
+                        "rolls_total": 0,
+                        "rolls_target": None,
+                        "rolls_remaining": None,
+                        "others_rolls": [],
+                        "predicted": {},
+                        "best_candidate": None,
+                        "summary": {},
+                        "oh_left": None,
+                        "oc_left": None,
+                        "oq_left": None,
+                        "oh_stored": None,
+                        "oc_stored": None,
+                        "oq_stored": None,
+                        "sphere_balance": None,
+                        "ouro_refill_min": None,
                         "pid": None,
                     }
                 )

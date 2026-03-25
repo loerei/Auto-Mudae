@@ -41,6 +41,7 @@ OQ_CACHE_VERSION_DEFAULT = "beam3_v1"
 OQ_LEGACY_CACHE_VERSION = "exact_v1"
 OQ_STATE_CACHE_FILENAME_TEMPLATE = "oq_success_prob_{version}.sqlite3"
 OQ_FIRST_SUGGESTION_FILENAME_TEMPLATE = "oq_first_suggestion_{version}.pkl"
+OQ_FALLBACK_FIRST_CLICK = 11
 OQ_LEGACY_CACHE_FILENAME = f"oq_success_prob_{OQ_LEGACY_CACHE_VERSION}.pkl"
 OQ_SQLITE_WRITE_BATCH_SIZE = 512
 OQ_SQLITE_CACHE_MB_MIN = 64
@@ -707,19 +708,29 @@ def _first_suggestion_cache_key(
 
 def _load_first_suggestion(max_clicks: int, cache_version: str, policy_signature: str) -> Optional[int]:
     path = _first_suggestion_cache_path(cache_version, policy_signature)
-    if not path.exists():
-        return None
-    try:
-        with open(path, "rb") as f:
-            payload = pickle.load(f)
-        if (
-            isinstance(payload, dict)
-            and payload.get("key") == _first_suggestion_cache_key(max_clicks, cache_version, policy_signature)
-            and isinstance(payload.get("pos"), int)
-        ):
-            return int(payload["pos"])
-    except Exception:
-        return None
+    candidate_paths = [path]
+    legacy_path = OURO_CACHE_DIR / OQ_FIRST_SUGGESTION_FILENAME_TEMPLATE.format(version=cache_version)
+    if legacy_path not in candidate_paths:
+        candidate_paths.append(legacy_path)
+
+    expected_key = _first_suggestion_cache_key(max_clicks, cache_version, policy_signature)
+    for candidate in candidate_paths:
+        if not candidate.exists():
+            continue
+        try:
+            with open(candidate, "rb") as f:
+                payload = pickle.load(f)
+            if (
+                isinstance(payload, dict)
+                and payload.get("key") == expected_key
+                and isinstance(payload.get("pos"), int)
+            ):
+                pos = int(payload["pos"])
+                if candidate != path:
+                    _save_first_suggestion(max_clicks, cache_version, policy_signature, pos)
+                return pos
+        except Exception:
+            continue
     return None
 
 
@@ -1056,6 +1067,8 @@ class OqSolver:
             initial = _load_first_suggestion(self.max_clicks, self.cache_version, self.policy_signature)
             if initial is not None and not self.is_revealed(initial):
                 return initial
+            if not self.is_revealed(OQ_FALLBACK_FIRST_CLICK):
+                return OQ_FALLBACK_FIRST_CLICK
         if self.possible_mask == 0:
             return self._fallback_next()
 

@@ -192,6 +192,11 @@ def control_mode(account_id: int, mode: str, action: str) -> Dict[str, Any]:
     raise HTTPException(status_code=400, detail=f"Unsupported action: {action}")
 
 
+@app.post("/api/accounts/{account_id}/force-stop")
+def force_stop_account(account_id: int) -> Dict[str, Any]:
+    return {"snapshot": supervisor.force_stop_account(account_id, clear_queue=True)}
+
+
 @app.get("/api/wishlist")
 def list_all_wishlist() -> Dict[str, Any]:
     return {
@@ -272,6 +277,11 @@ def post_queue(payload: QueuePayload) -> Dict[str, Any]:
         payload=payload.payload,
     )
     return {"item": item, "queue": db.list_queue(account_id=payload.account_id)}
+
+
+@app.delete("/api/accounts/{account_id}/queue")
+def delete_account_queue(account_id: int) -> Dict[str, Any]:
+    return supervisor.clear_queue(account_id)
 
 
 @app.get("/api/schedules")

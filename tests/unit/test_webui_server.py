@@ -52,3 +52,22 @@ def test_webui_overview_bootstraps_seeded_account(tmp_path, monkeypatch) -> None
     assert wishlist_payload["global"][0]["is_star"] is True
     assert settings.status_code == 200
     assert settings_payload["app_settings"]["MACHINE_TAG"] == "test-webui"
+
+
+def test_webui_force_stop_and_clear_queue_endpoints_are_available(tmp_path, monkeypatch) -> None:
+    temp_db = WebDB(tmp_path / "webui.db")
+    temp_supervisor = WebSupervisor(temp_db)
+    account = temp_db.upsert_account({"name": "Alpha", "token": "token-alpha", "max_power": 111})
+
+    monkeypatch.setattr(WebServer, "db", temp_db)
+    monkeypatch.setattr(WebServer, "supervisor", temp_supervisor)
+    monkeypatch.setattr(WebServer, "build_initial_import_bundle", lambda: {"accounts": [], "wishlists": {"global": [], "accounts": {}}})
+
+    with TestClient(WebServer.app) as client:
+        clear_response = client.delete(f"/api/accounts/{int(account['id'])}/queue")
+        stop_response = client.post(f"/api/accounts/{int(account['id'])}/force-stop")
+
+    assert clear_response.status_code == 200
+    assert clear_response.json()["cleared"] == 0
+    assert stop_response.status_code == 200
+    assert stop_response.json()["snapshot"]["status"] == "stopped"
