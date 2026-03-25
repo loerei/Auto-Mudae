@@ -17,6 +17,7 @@ from mudae.core import latency as Latency
 from mudae.discord import fetch as Fetch
 from mudae.paths import LOGS_DIR, ensure_runtime_dirs
 from mudae.parsers.time_parser import _parse_discord_timestamp
+from mudae.storage.coordination import acquire_lease, build_identity_scope
 from mudae.storage.json_array_log import append_json_array, ensure_json_array_file
 from mudae.storage.latency_metrics import record_event as record_latency_event
 from mudae.ouro.oh_config import load_oh_config, update_stats, default_stats_path
@@ -44,6 +45,8 @@ OH_COOLDOWN_RE = re.compile(
     r"You don't have enough \$oh.*?Time to wait before the refill:\s*(.+)",
     re.IGNORECASE | re.DOTALL,
 )
+ACTION_LEASE_TTL_SEC = 180.0
+ACTION_LEASE_HEARTBEAT_SEC = 20.0
 
 
 def _make_emitter(quiet: bool):
@@ -124,6 +127,23 @@ def _log_event(entry: Dict[str, Any]) -> None:
     payload = dict(entry)
     payload["ts"] = _timestamp()
     append_json_array(LOG_FILE, payload)
+
+
+def _acquire_action_lease(token: str, user_name: str):
+    scope, owner_label = build_identity_scope(
+        "mudae-action",
+        server_id=Vars.serverId,
+        channel_id=Vars.channelId,
+        token=token,
+        user_name=user_name,
+    )
+    return acquire_lease(
+        scope,
+        owner_label,
+        ttl_sec=ACTION_LEASE_TTL_SEC,
+        heartbeat_sec=ACTION_LEASE_HEARTBEAT_SEC,
+        wait_timeout_sec=0.0,
+    )
 
 
 def _select_user() -> Dict[str, str]:
@@ -662,6 +682,18 @@ def run_session(token: str, user_name: Optional[str] = None, quiet: bool = False
     stats_path = default_stats_path()
 
     resolved_name = user_name or "Unknown"
+    lease = _acquire_action_lease(token, resolved_name)
+    if not lease.acquired:
+        _log_event({
+            "type": "busy",
+            "message": "Skipped $oh because another same-account action is already running",
+            "user": resolved_name,
+            "channel_id": Vars.channelId,
+            "guild_id": Vars.serverId,
+            "source": "Oh_bot",
+        })
+        emit("Skipped $oh because another same-account action is already running.", "WARN")
+        return {"status": "busy", "reason": "same-account action already in progress"}
 
     oh_message_id = ""
     grid: Optional[OhGrid] = None
@@ -1083,6 +1115,8 @@ def run_session(token: str, user_name: Optional[str] = None, quiet: bool = False
                 "source": "Oh_bot",
             })
         return {"status": "error", "error": str(exc)}
+    finally:
+        lease.release()
 
 def main() -> None:
     print("\n" + "=" * 50)

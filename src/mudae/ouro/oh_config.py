@@ -5,6 +5,8 @@ from dataclasses import dataclass
 from typing import Any, Dict, Optional
 
 from mudae.paths import CONFIG_DIR, ensure_runtime_dirs
+from mudae.storage.atomic import atomic_write_json
+from mudae.storage.coordination import acquire_lease, build_path_scope
 
 
 ensure_runtime_dirs()
@@ -183,25 +185,33 @@ def update_stats(
 ) -> None:
     path = stats_path or default_stats_path()
     os.makedirs(os.path.dirname(path), exist_ok=True)
-    stats = _load_json(path, {})
-    if not isinstance(stats, dict):
-        stats = {}
-    counts = stats.get("color_counts")
-    if not isinstance(counts, dict):
-        counts = {}
+    with acquire_lease(
+        build_path_scope("json-file", path),
+        f"oh-stats@pid{os.getpid()}",
+        ttl_sec=30.0,
+        heartbeat_sec=10.0,
+        wait_timeout_sec=5.0,
+    ) as lease:
+        if not lease.acquired:
+            raise TimeoutError(f"Timed out acquiring OH stats lease for {path}")
+        stats = _load_json(path, {})
+        if not isinstance(stats, dict):
+            stats = {}
+        counts = stats.get("color_counts")
+        if not isinstance(counts, dict):
+            counts = {}
 
-    for color, delta in color_counts_delta.items():
-        if not color:
-            continue
-        key = _normalize_color_key(color)
-        if not key:
-            continue
-        prev = _as_int(counts.get(key, 0), 0)
-        new_val = prev + int(delta)
-        counts[key] = max(0, new_val)
+        for color, delta in color_counts_delta.items():
+            if not color:
+                continue
+            key = _normalize_color_key(color)
+            if not key:
+                continue
+            prev = _as_int(counts.get(key, 0), 0)
+            new_val = prev + int(delta)
+            counts[key] = max(0, new_val)
 
-    stats["color_counts"] = counts
-    stats["total_observed"] = max(0, sum(_as_int(v, 0) for v in counts.values()))
-    stats["updated_at"] = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())
-    with open(path, "w", encoding="utf-8") as f:
-        json.dump(stats, f, indent=2, ensure_ascii=False)
+        stats["color_counts"] = counts
+        stats["total_observed"] = max(0, sum(_as_int(v, 0) for v in counts.values()))
+        stats["updated_at"] = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())
+        atomic_write_json(path, stats, indent=2, ensure_ascii=False)

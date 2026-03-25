@@ -17,6 +17,7 @@ from mudae.core.session_engine import (
     log_warn,
     log_error,
     setCurrentUser,
+    setSessionLogFile,
     setStopRequested,
     probe_token_status,
     setConnectionStatus,
@@ -455,14 +456,15 @@ def main():
     # Set current user for per-user logging
     setCurrentUser(selected_user_name)
 
-    # Initialize per-user log file for this session
-    import os
+    # Initialize per-process session log file for this session.
     log_dir = os.fspath(LOGS_DIR)
     os.makedirs(log_dir, exist_ok=True)
-    log_filename = os.path.join(log_dir, f"Session.{selected_user_name}.log")
+    session_ms = int(time.time() * 1000)
+    log_filename = os.path.join(log_dir, f"Session.{selected_user_name}.pid{os.getpid()}.{session_ms}.log")
     with open(log_filename, 'w', encoding='utf-8') as f:
         f.write(f"=== Session Log - {time.strftime('%Y-%m-%d %H:%M:%S', time.localtime())} ===\n")
         f.write(f"User: {selected_user_name}\n\n")
+    setSessionLogFile(log_filename)
 
     log_info("Bot started!")
     log_info("Press Alt+C to restart bot and select a different user")

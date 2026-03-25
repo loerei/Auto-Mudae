@@ -7,6 +7,8 @@ import socket
 import threading
 import time
 import uuid
+import hashlib
+import random
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Dict, Optional
@@ -40,6 +42,37 @@ def _sanitize_scope(scope: str) -> str:
 
 def _lease_path(scope: str) -> Path:
     return LEASE_DIR / f"{_sanitize_scope(scope)}.json"
+
+
+def build_path_scope(prefix: str, path: str | os.PathLike[str]) -> str:
+    normalized = os.path.abspath(os.fspath(path))
+    digest = hashlib.sha1(normalized.lower().encode("utf-8")).hexdigest()[:16]
+    return f"{prefix}::{digest}"
+
+
+def build_identity_scope(
+    prefix: str,
+    *,
+    server_id: Any,
+    channel_id: Any,
+    token: str = "",
+    user_id: Optional[str] = None,
+    user_name: Optional[str] = None,
+) -> tuple[str, str]:
+    channel_key = str(channel_id or "unknown-channel")
+    server_key = str(server_id or "unknown-server")
+    token_hash = hashlib.sha1(token.encode("utf-8")).hexdigest()[:12] if token else "unknown"
+    identity_key = str(user_id or "").strip()
+    if not identity_key:
+        if isinstance(user_name, str) and user_name.strip():
+            identity_key = user_name.strip().lower()
+        else:
+            identity_key = f"token-{token_hash}"
+    owner_label = user_name or user_id or f"token-{token_hash}"
+    return (
+        f"{prefix}::{server_key}::{channel_key}::{identity_key}",
+        f"{owner_label}@pid{os.getpid()}",
+    )
 
 
 def _build_payload(scope: str, owner_label: str, ttl_sec: float) -> Dict[str, Any]:
@@ -216,7 +249,10 @@ def acquire_lease(
 
         if time.monotonic() >= deadline:
             break
-        time.sleep(min(max(0.05, poll_sec), max(0.0, deadline - time.monotonic())))
+        remaining = max(0.0, deadline - time.monotonic())
+        base_sleep = min(max(0.05, poll_sec), remaining)
+        jitter = min(0.25, max(0.01, base_sleep * 0.5))
+        time.sleep(min(remaining, base_sleep + random.uniform(0.0, jitter)))
 
     waited = max(0.0, time.monotonic() - start)
     return LeaseHandle(scope=scope, acquired=False, waited_sec=waited)

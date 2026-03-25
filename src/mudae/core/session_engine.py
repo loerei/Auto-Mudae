@@ -27,7 +27,7 @@ from mudae.parsers.time_parser import (
 )
 from mudae.parsers.card_parser import extractCardInfo, extractCardImageUrl, extractKeyCounts
 from mudae.parsers.reactions import _find_claim_button, _group_reaction_buttons, _message_has_kakera_button
-from mudae.storage.coordination import acquire_lease
+from mudae.storage.coordination import acquire_lease, build_identity_scope, build_path_scope
 from mudae.storage.json_array_log import append_json_array, ensure_json_array_file, iter_json_array
 from mudae.storage.latency_metrics import record_event as record_latency_event
 from mudae.paths import PROJECT_ROOT, LOGS_DIR, CONFIG_DIR, ensure_runtime_dirs
@@ -76,12 +76,15 @@ _last_seen_cache: Dict[str, str] = {}
 _last_seen_loaded: bool = False
 _last_seen_dirty: bool = False
 _last_seen_last_flush: float = 0.0
+_last_seen_file_signature: Optional[Tuple[int, int]] = None
 _last_seen_lock = threading.Lock()
 _last_tu_info_cache: Dict[str, Dict[str, Any]] = {}
 _last_tu_info_at: Dict[str, float] = {}
 _rawlog_lock = threading.Lock()
 _session_start_epoch: Dict[str, float] = {}
 _processed_manual_claim_ids: Dict[str, Set[str]] = {}
+_active_session_log_file: Optional[str] = None
+_active_session_rawresponse_file: Optional[str] = None
 
 def setStopRequested(value: bool) -> None:
     """Allow Bot to signal a stop request for faster interrupts."""
@@ -209,36 +212,55 @@ def _resolve_last_seen_path() -> str:
         return raw_path
     return os.fspath(PROJECT_ROOT / raw_path)
 
+def _get_file_signature(path: str) -> Optional[Tuple[int, int]]:
+    try:
+        stat = os.stat(path)
+        return (int(getattr(stat, "st_mtime_ns", int(stat.st_mtime * 1_000_000_000))), int(stat.st_size))
+    except OSError:
+        return None
+
+
+def _read_last_seen_file(path: str) -> Dict[str, str]:
+    try:
+        if not os.path.exists(path):
+            return {}
+        with open(path, 'r', encoding='utf-8') as f:
+            data = json.load(f)
+        if not isinstance(data, dict):
+            return {}
+        return {
+            str(key): str(value)
+            for key, value in data.items()
+            if value
+        }
+    except Exception:
+        return {}
+
+
+def _merge_last_seen_maps(base: Dict[str, str], incoming: Dict[str, str]) -> Dict[str, str]:
+    merged = {str(key): str(value) for key, value in base.items() if value}
+    for key, value in incoming.items():
+        channel_key = str(key)
+        message_id = str(value)
+        if not message_id:
+            continue
+        existing = merged.get(channel_key)
+        if not existing or _is_newer_message_id(message_id, existing):
+            merged[channel_key] = message_id
+    return merged
+
+
 def _load_last_seen_cache() -> None:
-    global _last_seen_loaded, _last_seen_cache, _last_seen_dirty
+    global _last_seen_loaded, _last_seen_cache, _last_seen_dirty, _last_seen_file_signature
     if _last_seen_loaded:
         return
     path = _resolve_last_seen_path()
     with _last_seen_lock:
         if _last_seen_loaded:
             return
-        try:
-            if os.path.exists(path):
-                with open(path, 'r', encoding='utf-8') as f:
-                    data = json.load(f)
-                if isinstance(data, dict):
-                    _last_seen_cache = {
-                        str(key): str(value)
-                        for key, value in data.items()
-                        if value
-                    }
-                else:
-                    _last_seen_cache = {}
-            else:
-                os.makedirs(os.path.dirname(path), exist_ok=True)
-                with open(path, 'w', encoding='utf-8') as f:
-                    json.dump({}, f, indent=2, ensure_ascii=False)
-                _last_seen_cache = {}
-            _last_seen_dirty = False
-        except Exception as exc:
-            _last_seen_cache = {}
-            _last_seen_dirty = False
-            log(f"Warning: Failed to load last seen cache: {exc}")
+        _last_seen_cache = _read_last_seen_file(path)
+        _last_seen_dirty = False
+        _last_seen_file_signature = _get_file_signature(path)
         _last_seen_loaded = True
 
 def _is_newer_message_id(new_id: str, old_id: str) -> bool:
@@ -247,15 +269,29 @@ def _is_newer_message_id(new_id: str, old_id: str) -> bool:
     except (TypeError, ValueError):
         return new_id != old_id
 
+def _refresh_last_seen_cache_from_disk(force: bool = False) -> None:
+    global _last_seen_cache, _last_seen_file_signature
+    _load_last_seen_cache()
+    path = _resolve_last_seen_path()
+    signature = _get_file_signature(path)
+    with _last_seen_lock:
+        if not force and signature == _last_seen_file_signature:
+            return
+    disk_payload = _read_last_seen_file(path)
+    with _last_seen_lock:
+        _last_seen_cache = _merge_last_seen_maps(_last_seen_cache, disk_payload)
+        _last_seen_file_signature = signature
+
+
 def _get_last_seen(channel_id: str) -> Optional[str]:
     if not channel_id:
         return None
-    _load_last_seen_cache()
+    _refresh_last_seen_cache_from_disk()
     with _last_seen_lock:
         return _last_seen_cache.get(str(channel_id))
 
 def _flush_last_seen_cache(force: bool = False) -> None:
-    global _last_seen_dirty, _last_seen_last_flush
+    global _last_seen_dirty, _last_seen_last_flush, _last_seen_cache, _last_seen_file_signature
     if not _last_seen_loaded:
         return
     try:
@@ -270,15 +306,30 @@ def _flush_last_seen_cache(force: bool = False) -> None:
         if not force and (now - _last_seen_last_flush) < interval:
             return
         payload = dict(_last_seen_cache)
-        _last_seen_dirty = False
-        _last_seen_last_flush = now
     path = _resolve_last_seen_path()
+    scope = build_path_scope("last-seen", path)
     try:
-        os.makedirs(os.path.dirname(path), exist_ok=True)
-        temp_path = f"{path}.tmp"
-        with open(temp_path, 'w', encoding='utf-8') as f:
-            json.dump(payload, f, indent=2, ensure_ascii=False)
-        os.replace(temp_path, path)
+        with acquire_lease(
+            scope,
+            f"last-seen@pid{os.getpid()}",
+            ttl_sec=30.0,
+            heartbeat_sec=5.0,
+            wait_timeout_sec=30.0,
+        ) as lease:
+            if not lease.acquired:
+                raise TimeoutError(f"Timed out acquiring last-seen lease for {path}")
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            merged_payload = _merge_last_seen_maps(_read_last_seen_file(path), payload)
+            temp_path = f"{path}.{os.getpid()}.{threading.get_ident()}.tmp"
+            with open(temp_path, 'w', encoding='utf-8') as f:
+                json.dump(merged_payload, f, indent=2, ensure_ascii=False)
+            os.replace(temp_path, path)
+            signature = _get_file_signature(path)
+        with _last_seen_lock:
+            _last_seen_cache = _merge_last_seen_maps(_last_seen_cache, merged_payload)
+            _last_seen_dirty = False
+            _last_seen_last_flush = now
+            _last_seen_file_signature = signature
     except Exception as exc:
         with _last_seen_lock:
             _last_seen_dirty = True
@@ -288,7 +339,7 @@ def _mark_last_seen(channel_id: str, message_id: Optional[str]) -> None:
     global _last_seen_dirty
     if not channel_id or not message_id:
         return
-    _load_last_seen_cache()
+    _refresh_last_seen_cache_from_disk()
     channel_key = str(channel_id)
     message_key = str(message_id)
     with _last_seen_lock:
@@ -401,6 +452,43 @@ def setCurrentUser(user_name: str, user_id: Optional[str] = None) -> None:
     current_user_id = user_id
     _dashboard_state['user'] = user_name
 
+
+def setSessionLogFile(path: Optional[str]) -> None:
+    global _active_session_log_file
+    _active_session_log_file = path
+
+
+def setSessionRawResponseFile(path: Optional[str]) -> None:
+    global _active_session_rawresponse_file
+    _active_session_rawresponse_file = path
+
+
+def getSessionRawResponseFile() -> str:
+    if _active_session_rawresponse_file:
+        return _active_session_rawresponse_file
+    return os.fspath(LOGS_DIR / 'SessionRawresponse.json')
+
+
+def _sanitize_log_component(value: Optional[str], fallback: str) -> str:
+    raw = (value or "").strip()
+    if not raw:
+        raw = fallback
+    cleaned = re.sub(r"[^A-Za-z0-9._-]+", "_", raw)
+    return cleaned or fallback
+
+
+def _build_session_artifact_path(
+    prefix: str,
+    suffix: str,
+    *,
+    user_name: Optional[str],
+    session_epoch: Optional[float],
+) -> str:
+    user_key = _sanitize_log_component(user_name, "unknown")
+    session_ms = int((session_epoch or time.time()) * 1000)
+    filename = f"{prefix}.{user_key}.pid{os.getpid()}.{session_ms}{suffix}"
+    return os.fspath(LOGS_DIR / filename)
+
 def _get_user_id_for_token(token: Optional[str]) -> Optional[str]:
     if token and token in current_user_ids:
         return current_user_ids[token]
@@ -469,6 +557,8 @@ def probe_token_status(token: Optional[str]) -> Dict[str, Any]:
 
 def getSessionLogFile() -> str:
     """Get the per-user session log filename"""
+    if _active_session_log_file:
+        return _active_session_log_file
     if current_user_name:
         log_file = os.fspath(LOGS_DIR / f"Session.{current_user_name}.log")
         return log_file
@@ -1102,7 +1192,8 @@ def loadClaimStats() -> Dict[str, Any]:
             return initializeClaimStats()
         
         with open(CLAIM_STATS_FILE, 'r', encoding='utf-8') as f:
-            return json.load(f)
+            payload = json.load(f)
+        return payload if isinstance(payload, dict) else initializeClaimStats()
     except Exception as e:
         log(f"Error loading claim stats: {e}")
         return initializeClaimStats()
@@ -1126,7 +1217,8 @@ def saveClaimStats(stats: Dict[str, Any]) -> None:
     """Save claim statistics to file"""
     try:
         stats['last_updated'] = time.strftime('%Y-%m-%d %H:%M:%S', time.localtime())
-        temp_path = f"{CLAIM_STATS_FILE}.tmp"
+        os.makedirs(os.path.dirname(CLAIM_STATS_FILE), exist_ok=True)
+        temp_path = f"{CLAIM_STATS_FILE}.{os.getpid()}.{threading.get_ident()}.tmp"
         with open(temp_path, 'w', encoding='utf-8') as f:
             json.dump(stats, f, indent=2, ensure_ascii=False)
         os.replace(temp_path, CLAIM_STATS_FILE)
@@ -1141,18 +1233,32 @@ def updateClaimStats(character_name: str, kakera: int, user_id: Optional[str] = 
     if not user_id:
         log(f"⚠️  Cannot update claim stats: no user ID")
         return
-    
-    stats = loadClaimStats()
-    user_stats = getOrInitializeUserStats(stats, user_id)
-    user_stats['total_claims'] += 1
-    user_stats['total_kakera'] += kakera
-    user_stats['characters_claimed'].append({
-        'name': character_name,
-        'kakera': kakera,
-        'timestamp': time.strftime('%Y-%m-%d %H:%M:%S', time.localtime())
-    })
-    user_stats['last_updated'] = time.strftime('%Y-%m-%d %H:%M:%S', time.localtime())
-    saveClaimStats(stats)
+
+    scope = build_path_scope("claim-stats", CLAIM_STATS_FILE)
+    try:
+        with acquire_lease(
+            scope,
+            f"claim-stats@pid{os.getpid()}",
+            ttl_sec=30.0,
+            heartbeat_sec=5.0,
+            wait_timeout_sec=30.0,
+        ) as lease:
+            if not lease.acquired:
+                log("⚠️  Cannot update claim stats: coordination lease unavailable")
+                return
+            stats = loadClaimStats()
+            user_stats = getOrInitializeUserStats(stats, user_id)
+            user_stats['total_claims'] += 1
+            user_stats['total_kakera'] += kakera
+            user_stats['characters_claimed'].append({
+                'name': character_name,
+                'kakera': kakera,
+                'timestamp': time.strftime('%Y-%m-%d %H:%M:%S', time.localtime())
+            })
+            user_stats['last_updated'] = time.strftime('%Y-%m-%d %H:%M:%S', time.localtime())
+            saveClaimStats(stats)
+    except Exception as exc:
+        log(f"⚠️  Cannot update claim stats: {exc}")
 
 def getUserNameForToken(token: str) -> Optional[str]:
     """Resolve display name for a token from Vars.tokens."""
@@ -1455,9 +1561,9 @@ def scanForManualClaims(token: str, target_username: str, include_persistent: bo
             marriage_bonus[key] = {'kakera': kakera, 'timestamp': parsed_ts}
 
         # Prefer JSON logs; fall back to MD logs for backward compatibility.
-        session_json = os.fspath(LOGS_DIR / 'SessionRawresponse.json')
+        session_json = getSessionRawResponseFile()
         persistent_json = os.fspath(LOGS_DIR / 'Rawresponse.json')
-        session_md = os.fspath(LOGS_DIR / 'SessionRawresponse.md')
+        session_md = session_json[:-5] + '.md' if session_json.endswith('.json') else os.fspath(LOGS_DIR / 'SessionRawresponse.md')
         persistent_md = os.fspath(LOGS_DIR / 'Rawresponse.md')
 
         log_paths: List[str] = []
@@ -2958,7 +3064,7 @@ def logRawResponse(label: str, response_data: Any) -> None:
 def logSessionRawResponse(label: str, response_data: Any) -> None:
     """Log raw Discord API response data to SessionRawresponse.json (per session)."""
     try:
-        session_rawresponse_file = os.fspath(LOGS_DIR / 'SessionRawresponse.json')
+        session_rawresponse_file = getSessionRawResponseFile()
         timestamp = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())
         entry: Dict[str, Any] = {
             'ts': timestamp,
@@ -3016,10 +3122,14 @@ def initializeSession(token: str, expected_username: str = "") -> None:
         seeded_id = _get_last_seen(Vars.channelId)
         if seeded_id:
             external_after_ids[token] = seeded_id
-        session_rawresponse_file = os.fspath(LOGS_DIR / 'SessionRawresponse.json')
-        os.makedirs(os.path.dirname(session_rawresponse_file), exist_ok=True)
-        with open(session_rawresponse_file, 'w', encoding='utf-8') as f:
-            f.write("[]\n")
+        session_rawresponse_file = _build_session_artifact_path(
+            "SessionRawresponse",
+            ".json",
+            user_name=user_name or resolved_name or expected_username,
+            session_epoch=session_start_epoch,
+        )
+        setSessionRawResponseFile(session_rawresponse_file)
+        ensure_json_array_file(session_rawresponse_file)
         append_json_array(session_rawresponse_file, {
             'ts': session_start_time,
             'ts_epoch': session_start_epoch,
@@ -3029,10 +3139,7 @@ def initializeSession(token: str, expected_username: str = "") -> None:
             'guild_id': Vars.serverId,
             'source': 'Function.initializeSession'
         }, lock=_rawlog_lock)
-        
-        # Reset claim statistics for new session
-        saveClaimStats(initializeClaimStats())
-        
+
         log("🔍 Initializing session...")
         tuCommand = getSlashCommand(bot, ['tu'])
         if not tuCommand:
@@ -3680,16 +3787,28 @@ def matchesWishlist(cardName: str, cardSeries: str, mudae_star_wishes: Optional[
 
 def pollExternalRolls(token: str, limit: int = 50) -> int:
     """Poll recent channel messages for other users' rolls."""
+    lease = None
     try:
         bot, auth = getClientAndAuth(token)
         url = getUrl()
-        resolved_id, _ = _ensure_user_identity(token)
+        resolved_id, resolved_name = _ensure_user_identity(token)
+        if bool(getattr(Vars, "ROLL_COORDINATION_ENABLED", True)):
+            scope, owner_label = _build_roll_coordination_scope(token, resolved_id, resolved_name)
+            lease = acquire_lease(
+                scope,
+                f"scan:{owner_label}",
+                ttl_sec=min(30.0, max(5.0, float(getattr(Vars, "ROLL_LEASE_TTL_SEC", 90.0) or 90.0))),
+                heartbeat_sec=max(1.0, float(getattr(Vars, "ROLL_LEASE_HEARTBEAT_SEC", 10.0) or 10.0)),
+                wait_timeout_sec=0.0,
+                cancel_check=_should_stop,
+            )
+            if not lease.acquired:
+                return external_scan_activity.get(token, 0)
         after_id = external_after_ids.get(token)
-        if not after_id:
-            seeded_id = _get_last_seen(Vars.channelId)
-            if seeded_id:
-                after_id = seeded_id
-                external_after_ids[token] = seeded_id
+        seeded_id = _get_last_seen(Vars.channelId)
+        if seeded_id and (not after_id or _is_newer_message_id(seeded_id, after_id)):
+            after_id = seeded_id
+            external_after_ids[token] = seeded_id
 
         _, messages = Fetch.fetch_messages(url, auth, after_id=after_id, limit=limit)
         if not messages:
@@ -3722,6 +3841,9 @@ def pollExternalRolls(token: str, limit: int = 50) -> int:
     except Exception as exc:
         log(f"Warning: External roll scan failed: {exc}")
         return -1
+    finally:
+        if lease is not None:
+            lease.release()
 
 def _try_external_kakera_react(
     message: Dict[str, Any],
@@ -4317,6 +4439,9 @@ def run_ouro_auto(
                 log_warn(f"{label} auto failed: {exc}")
                 break
             if isinstance(result, dict):
+                if result.get('status') == 'busy':
+                    log_info(f"Skip {label} auto: another same-account action is already in progress")
+                    break
                 if result.get('status') == 'cooldown':
                     break
                 if result.get('status') == 'error':
@@ -4358,19 +4483,13 @@ def _build_roll_coordination_scope(
     user_id: Optional[str],
     user_name: Optional[str],
 ) -> Tuple[str, str]:
-    channel_key = str(Vars.channelId or "unknown-channel")
-    server_key = str(Vars.serverId or "unknown-server")
-    token_hash = hashlib.sha1(token.encode("utf-8")).hexdigest()[:12] if token else "unknown"
-    identity_key = str(user_id or "").strip()
-    if not identity_key:
-        if isinstance(user_name, str) and user_name.strip():
-            identity_key = user_name.strip().lower()
-        else:
-            identity_key = f"token-{token_hash}"
-    owner_label = user_name or user_id or f"token-{token_hash}"
-    return (
-        f"roll::{server_key}::{channel_key}::{identity_key}",
-        f"{owner_label}@pid{os.getpid()}",
+    return build_identity_scope(
+        "mudae-action",
+        server_id=Vars.serverId,
+        channel_id=Vars.channelId,
+        token=token,
+        user_id=user_id,
+        user_name=user_name,
     )
 
 

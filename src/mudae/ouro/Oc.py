@@ -14,6 +14,8 @@ from itertools import combinations
 from multiprocessing import Pool, cpu_count, current_process
 
 from mudae.paths import OURO_CACHE_DIR, ensure_runtime_dirs
+from mudae.storage.atomic import atomic_write_pickle
+from mudae.storage.coordination import acquire_lease, build_path_scope
 
 class SphereColor(Enum):
     """Sphere colors with their point values"""
@@ -41,6 +43,11 @@ ensure_runtime_dirs()
 
 def _likelihood_cache_path() -> str:
     return os.fspath(OURO_CACHE_DIR / LIKELIHOOD_CACHE_FILENAME)
+
+
+def _load_pickle_payload(path: str):
+    with open(path, "rb") as f:
+        return pickle.load(f)
 
 
 def _build_likelihoods_exact() -> Dict:
@@ -138,25 +145,40 @@ def _load_or_build_likelihoods() -> Dict:
     cache_path = _likelihood_cache_path()
     if os.path.exists(cache_path):
         try:
-            with open(cache_path, "rb") as f:
-                payload = pickle.load(f)
+            payload = _load_pickle_payload(cache_path)
             if isinstance(payload, dict) and payload.get("version") == LIKELIHOOD_CACHE_VERSION:
                 print(f"[OC] Loaded cached likelihoods from {os.path.basename(cache_path)}")
                 return payload["likelihoods"]
         except Exception:
             pass
 
-    likelihood = _build_likelihoods_exact()
     try:
-        with open(cache_path, "wb") as f:
-            pickle.dump(
+        with acquire_lease(
+            build_path_scope("pickle-file", cache_path),
+            f"oc-likelihood@pid{os.getpid()}",
+            ttl_sec=600.0,
+            heartbeat_sec=30.0,
+            wait_timeout_sec=300.0,
+        ) as lease:
+            if not lease.acquired:
+                raise TimeoutError(f"Timed out acquiring OC likelihood cache lease for {cache_path}")
+            if os.path.exists(cache_path):
+                try:
+                    payload = _load_pickle_payload(cache_path)
+                    if isinstance(payload, dict) and payload.get("version") == LIKELIHOOD_CACHE_VERSION:
+                        print(f"[OC] Loaded cached likelihoods from {os.path.basename(cache_path)}")
+                        return payload["likelihoods"]
+                except Exception:
+                    pass
+            likelihood = _build_likelihoods_exact()
+            atomic_write_pickle(
+                cache_path,
                 {"version": LIKELIHOOD_CACHE_VERSION, "likelihoods": likelihood},
-                f,
-                protocol=pickle.HIGHEST_PROTOCOL,
             )
+            return likelihood
     except Exception:
         pass
-    return likelihood
+    return _build_likelihoods_exact()
 
 
 # Load likelihoods at module initialization

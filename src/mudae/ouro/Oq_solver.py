@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import argparse
 import atexit
+import hashlib
 import itertools
 import math
 import os
@@ -20,6 +21,8 @@ from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Sequence, Set, Tuple
 
 from mudae.paths import OURO_CACHE_DIR, ensure_runtime_dirs
+from mudae.storage.atomic import atomic_write_pickle
+from mudae.storage.coordination import acquire_lease, build_path_scope
 
 GRID_SIZE = 5
 TOTAL_CELLS = GRID_SIZE * GRID_SIZE
@@ -162,12 +165,32 @@ def _policy_signature(policy_mode: str, beam_k: int) -> str:
     raise ValueError(f"Unknown policy mode: {policy_mode}")
 
 
-def _state_cache_path(cache_version: str) -> Path:
-    return OURO_CACHE_DIR / OQ_STATE_CACHE_FILENAME_TEMPLATE.format(version=cache_version)
+def _policy_cache_suffix(policy_signature: str) -> str:
+    normalized = str(policy_signature or "default").strip() or "default"
+    return hashlib.sha1(normalized.encode("utf-8")).hexdigest()[:12]
 
 
-def _first_suggestion_cache_path(cache_version: str) -> Path:
-    return OURO_CACHE_DIR / OQ_FIRST_SUGGESTION_FILENAME_TEMPLATE.format(version=cache_version)
+def _state_cache_path(cache_version: str, policy_signature: str = "") -> Path:
+    filename = OQ_STATE_CACHE_FILENAME_TEMPLATE.format(version=cache_version)
+    if policy_signature:
+        path = Path(filename)
+        filename = f"{path.stem}_{_policy_cache_suffix(policy_signature)}{path.suffix}"
+    return OURO_CACHE_DIR / filename
+
+
+def _first_suggestion_cache_path(cache_version: str, policy_signature: str = "") -> Path:
+    filename = OQ_FIRST_SUGGESTION_FILENAME_TEMPLATE.format(version=cache_version)
+    if policy_signature:
+        path = Path(filename)
+        filename = f"{path.stem}_{_policy_cache_suffix(policy_signature)}{path.suffix}"
+    return OURO_CACHE_DIR / filename
+
+
+def _cache_maintenance_scope(cache_version: str, policy_signature: str) -> str:
+    return build_path_scope(
+        "oq-maintenance",
+        os.fspath(_state_cache_path(cache_version, policy_signature)),
+    )
 
 
 def _legacy_cache_path() -> Path:
@@ -247,9 +270,15 @@ class OqStateCache:
         max_db_bytes: Optional[int] = None,
         enable_legacy_migration: bool = False,
     ) -> None:
-        self.cache_path = cache_path
         self.version = version
         self.policy_signature = policy_signature
+        normalized_cache_path = Path(cache_path)
+        legacy_name = OQ_STATE_CACHE_FILENAME_TEMPLATE.format(version=version)
+        if self.policy_signature and normalized_cache_path.name == legacy_name:
+            normalized_cache_path = normalized_cache_path.with_name(
+                _state_cache_path(version, self.policy_signature).name
+            )
+        self.cache_path = normalized_cache_path
         self.cache_ram_mb = max(1, int(cache_ram_mb))
         self.memory_limit_bytes = max(1, self.cache_ram_mb * 1024 * 1024)
         self.write_batch_size = _recommended_write_batch_size(self.cache_ram_mb)
@@ -611,7 +640,8 @@ def _get_state_cache(
 ) -> OqStateCache:
     global _GLOBAL_STATE_CACHE, _GLOBAL_STATE_CACHE_KEY
     ensure_runtime_dirs()
-    cache_path = _state_cache_path(cache_version)
+    cache_path = _state_cache_path(cache_version, policy_signature)
+    first_suggestion_path = _first_suggestion_cache_path(cache_version, policy_signature)
     max_db_bytes = int(max(0.0, float(max_cache_gb)) * 1024 * 1024 * 1024)
     key = (
         os.fspath(cache_path),
@@ -622,15 +652,26 @@ def _get_state_cache(
     )
 
     if force_rebuild:
-        reset_global_state_cache()
-        try:
-            cache_path.unlink(missing_ok=True)
-        except Exception:
-            pass
-        try:
-            _first_suggestion_cache_path(cache_version).unlink(missing_ok=True)
-        except Exception:
-            pass
+        with acquire_lease(
+            _cache_maintenance_scope(cache_version, policy_signature),
+            f"oq-rebuild@pid{os.getpid()}",
+            ttl_sec=600.0,
+            heartbeat_sec=30.0,
+            wait_timeout_sec=300.0,
+        ) as lease:
+            if not lease.acquired:
+                raise TimeoutError(
+                    f"Timed out acquiring OQ rebuild lease for {cache_path}"
+                )
+            reset_global_state_cache()
+            try:
+                cache_path.unlink(missing_ok=True)
+            except Exception:
+                pass
+            try:
+                first_suggestion_path.unlink(missing_ok=True)
+            except Exception:
+                pass
 
     if _GLOBAL_STATE_CACHE is None or _GLOBAL_STATE_CACHE_KEY != key:
         reset_global_state_cache()
@@ -665,7 +706,7 @@ def _first_suggestion_cache_key(
 
 
 def _load_first_suggestion(max_clicks: int, cache_version: str, policy_signature: str) -> Optional[int]:
-    path = _first_suggestion_cache_path(cache_version)
+    path = _first_suggestion_cache_path(cache_version, policy_signature)
     if not path.exists():
         return None
     try:
@@ -683,16 +724,23 @@ def _load_first_suggestion(max_clicks: int, cache_version: str, policy_signature
 
 
 def _save_first_suggestion(max_clicks: int, cache_version: str, policy_signature: str, pos: int) -> None:
-    path = _first_suggestion_cache_path(cache_version)
+    path = _first_suggestion_cache_path(cache_version, policy_signature)
     try:
-        with open(path, "wb") as f:
-            pickle.dump(
+        with acquire_lease(
+            build_path_scope("pickle-file", path),
+            f"oq-first-suggestion@pid{os.getpid()}",
+            ttl_sec=30.0,
+            heartbeat_sec=10.0,
+            wait_timeout_sec=5.0,
+        ) as lease:
+            if not lease.acquired:
+                raise TimeoutError(f"Timed out acquiring OQ first suggestion lease for {path}")
+            atomic_write_pickle(
+                path,
                 {
                     "key": _first_suggestion_cache_key(max_clicks, cache_version, policy_signature),
                     "pos": int(pos),
                 },
-                f,
-                protocol=pickle.HIGHEST_PROTOCOL,
             )
     except Exception:
         pass
@@ -1321,7 +1369,7 @@ def build_cache_for_initial_state(
         "beam_k": beam_k,
         "policy_signature": policy_signature,
         "cache_stats": stats,
-        "cache_path": os.fspath(_state_cache_path(cache_version)),
+        "cache_path": os.fspath(_state_cache_path(cache_version, policy_signature)),
     }
 
 
@@ -1341,7 +1389,7 @@ def get_cache_stats(
         enable_legacy_migration=False,
     )
     stats = cache.stats(include_db=True)
-    stats["cache_path"] = os.fspath(_state_cache_path(cache_version))
+    stats["cache_path"] = os.fspath(_state_cache_path(cache_version, policy_signature))
     stats["policy_signature"] = policy_signature
     return stats
 
@@ -1659,72 +1707,80 @@ def trim_cache_to_first_branch(
     ensure_runtime_dirs()
     reset_global_state_cache()
 
-    cache_path = _state_cache_path(cache_version)
+    policy_signature = _policy_signature(OQ_POLICY_MODE_BEAM, beam_k)
+    cache_path = _state_cache_path(cache_version, policy_signature)
     if not cache_path.exists():
         raise FileNotFoundError(f"Cache DB not found: {cache_path}")
-
-    policy_signature = _policy_signature(OQ_POLICY_MODE_BEAM, beam_k)
     first_pos = _load_first_suggestion(max_clicks, cache_version, policy_signature)
 
-    conn = sqlite3.connect(os.fspath(cache_path), timeout=120.0)
-    try:
-        _assert_cache_policy_signature(conn, policy_signature)
-        if first_pos is None:
-            root_state: StateKey = (ALL_CONFIG_MASK, 0, 0, max_clicks)
-            first_pos = _pick_policy_action_from_db(conn, root_state, OrderedDict(), beam_k=beam_k)
+    with acquire_lease(
+        _cache_maintenance_scope(cache_version, policy_signature),
+        f"oq-trim@pid{os.getpid()}",
+        ttl_sec=600.0,
+        heartbeat_sec=30.0,
+        wait_timeout_sec=300.0,
+    ) as lease:
+        if not lease.acquired:
+            raise TimeoutError(f"Timed out acquiring OQ trim lease for {cache_path}")
+        conn = sqlite3.connect(os.fspath(cache_path), timeout=120.0)
+        try:
+            _assert_cache_policy_signature(conn, policy_signature)
             if first_pos is None:
-                raise RuntimeError(
-                    f"First suggestion cache missing for version={cache_version}, clicks={max_clicks} "
-                    "and could not infer from current DB."
+                root_state: StateKey = (ALL_CONFIG_MASK, 0, 0, max_clicks)
+                first_pos = _pick_policy_action_from_db(conn, root_state, OrderedDict(), beam_k=beam_k)
+                if first_pos is None:
+                    raise RuntimeError(
+                        f"First suggestion cache missing for version={cache_version}, clicks={max_clicks} "
+                        "and could not infer from current DB."
+                    )
+                _save_first_suggestion(max_clicks, cache_version, policy_signature, first_pos)
+
+            before_rows = int(conn.execute("SELECT COUNT(*) FROM states").fetchone()[0])
+            page_size = int(conn.execute("PRAGMA page_size").fetchone()[0])
+            before_pages = int(conn.execute("PRAGMA page_count").fetchone()[0])
+            before_bytes = page_size * before_pages
+
+            trim_details: Dict[str, Any]
+            if mode == "first_bit":
+                trimmed_rows = _trim_cache_first_bit(conn, max_clicks=max_clicks, first_pos=first_pos)
+                trim_details = {"trimmed_rows": trimmed_rows}
+            elif mode == "policy_eval":
+                trim_details = _trim_cache_policy_eval(
+                    conn,
+                    max_clicks=max_clicks,
+                    first_pos=first_pos,
+                    beam_k=beam_k,
                 )
-            _save_first_suggestion(max_clicks, cache_version, policy_signature, first_pos)
+                trimmed_rows = int(trim_details.get("trimmed_rows", 0))
+            else:
+                raise ValueError(f"Unknown trim mode: {mode}. Use 'policy_eval' or 'first_bit'.")
 
-        before_rows = int(conn.execute("SELECT COUNT(*) FROM states").fetchone()[0])
-        page_size = int(conn.execute("PRAGMA page_size").fetchone()[0])
-        before_pages = int(conn.execute("PRAGMA page_count").fetchone()[0])
-        before_bytes = page_size * before_pages
+            after_rows = int(conn.execute("SELECT COUNT(*) FROM states").fetchone()[0])
 
-        trim_details: Dict[str, Any]
-        if mode == "first_bit":
-            trimmed_rows = _trim_cache_first_bit(conn, max_clicks=max_clicks, first_pos=first_pos)
-            trim_details = {"trimmed_rows": trimmed_rows}
-        elif mode == "policy_eval":
-            trim_details = _trim_cache_policy_eval(
-                conn,
-                max_clicks=max_clicks,
-                first_pos=first_pos,
-                beam_k=beam_k,
-            )
-            trimmed_rows = int(trim_details.get("trimmed_rows", 0))
-        else:
-            raise ValueError(f"Unknown trim mode: {mode}. Use 'policy_eval' or 'first_bit'.")
+            if vacuum:
+                conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+                conn.execute("VACUUM")
+                conn.commit()
 
-        after_rows = int(conn.execute("SELECT COUNT(*) FROM states").fetchone()[0])
+            after_pages = int(conn.execute("PRAGMA page_count").fetchone()[0])
+            after_bytes = page_size * after_pages
 
-        if vacuum:
-            conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
-            conn.execute("VACUUM")
-            conn.commit()
-
-        after_pages = int(conn.execute("PRAGMA page_count").fetchone()[0])
-        after_bytes = page_size * after_pages
-
-        return {
-            "cache_path": os.fspath(cache_path),
-            "first_pos": first_pos,
-            "beam_k": beam_k,
-            "policy_signature": policy_signature,
-            "mode": mode,
-            "before_rows": before_rows,
-            "after_rows": after_rows,
-            "trimmed_rows": trimmed_rows,
-            "before_bytes": before_bytes,
-            "after_bytes": after_bytes,
-            "vacuum": bool(vacuum),
-            **trim_details,
-        }
-    finally:
-        conn.close()
+            return {
+                "cache_path": os.fspath(cache_path),
+                "first_pos": first_pos,
+                "beam_k": beam_k,
+                "policy_signature": policy_signature,
+                "mode": mode,
+                "before_rows": before_rows,
+                "after_rows": after_rows,
+                "trimmed_rows": trimmed_rows,
+                "before_bytes": before_bytes,
+                "after_bytes": after_bytes,
+                "vacuum": bool(vacuum),
+                **trim_details,
+            }
+        finally:
+            conn.close()
 
 
 def main(argv: Optional[Sequence[str]] = None) -> None:

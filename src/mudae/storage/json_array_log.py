@@ -3,12 +3,45 @@ import os
 import threading
 from typing import Any, Dict, Iterator, Optional
 
+from mudae.storage.coordination import acquire_lease, build_path_scope
 
-def ensure_json_array_file(path: str) -> None:
+
+_PATH_LOCKS: Dict[str, threading.RLock] = {}
+_PATH_LOCKS_GUARD = threading.Lock()
+
+
+def _get_path_lock(path: str) -> threading.RLock:
+    normalized = os.path.abspath(path)
+    with _PATH_LOCKS_GUARD:
+        lock = _PATH_LOCKS.get(normalized)
+        if lock is None:
+            lock = threading.RLock()
+            _PATH_LOCKS[normalized] = lock
+        return lock
+
+
+def _ensure_json_array_file_unlocked(path: str) -> None:
     os.makedirs(os.path.dirname(path), exist_ok=True)
     if not os.path.exists(path):
         with open(path, "wb") as f:
             f.write(b"[]\n")
+
+
+def ensure_json_array_file(path: str) -> None:
+    path = os.path.abspath(path)
+    lock = _get_path_lock(path)
+    scope = build_path_scope("json-array-log", path)
+    with lock:
+        with acquire_lease(
+            scope,
+            f"json-array-log@pid{os.getpid()}",
+            ttl_sec=30.0,
+            heartbeat_sec=5.0,
+            wait_timeout_sec=30.0,
+        ) as lease:
+            if not lease.acquired:
+                raise TimeoutError(f"Timed out acquiring JSON log lease for {path}")
+            _ensure_json_array_file_unlocked(path)
 
 
 def _find_last_non_ws_byte(f) -> Optional[tuple[int, int]]:
@@ -52,12 +85,21 @@ def append_json_array(path: str, obj: Dict[str, Any], lock: Optional[threading.L
     Append an object to a JSON array file without rewriting the whole file.
     The file is kept as a valid JSON array at all times.
     """
-    if lock is None:
-        _lock = threading.Lock()
-        lock = _lock
+    path = os.path.abspath(path)
+    path_lock = lock or _get_path_lock(path)
+    scope = build_path_scope("json-array-log", path)
 
-    with lock:
-        ensure_json_array_file(path)
+    with path_lock:
+        with acquire_lease(
+            scope,
+            f"json-array-log@pid{os.getpid()}",
+            ttl_sec=30.0,
+            heartbeat_sec=5.0,
+            wait_timeout_sec=30.0,
+        ) as lease:
+            if not lease.acquired:
+                raise TimeoutError(f"Timed out acquiring JSON log lease for {path}")
+            _ensure_json_array_file_unlocked(path)
         encoded = json.dumps(obj, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
 
         with open(path, "r+b") as f:

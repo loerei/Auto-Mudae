@@ -32,6 +32,8 @@ from itertools import combinations
 from multiprocessing import Pool, cpu_count
 import atexit
 from mudae.paths import OURO_CACHE_DIR, ensure_runtime_dirs
+from mudae.storage.atomic import atomic_write_pickle, atomic_write_text
+from mudae.storage.coordination import acquire_lease, build_path_scope
 
 MAX_CLICKS = 5
 TIME_LIMIT_SECONDS = 9999
@@ -88,18 +90,47 @@ def _policy_cache_path() -> str:
     return os.fspath(OURO_CACHE_DIR / POLICY_CACHE_FILENAME)
 
 
+def _load_pickle_payload(path: str):
+    with open(path, "rb") as f:
+        return pickle.load(f)
+
+
+def _atomic_append_line(path: str, line: str) -> None:
+    with acquire_lease(
+        build_path_scope("text-file", path),
+        f"oc-load-log@pid{os.getpid()}",
+        ttl_sec=10.0,
+        heartbeat_sec=5.0,
+        wait_timeout_sec=5.0,
+    ) as lease:
+        if not lease.acquired:
+            raise TimeoutError(f"Timed out acquiring OC load log lease for {path}")
+        existing = ""
+        if os.path.exists(path):
+            try:
+                with open(path, "r", encoding="utf-8") as f:
+                    existing = f.read()
+            except Exception:
+                existing = ""
+        atomic_write_text(path, existing + line)
+
+
 def _log_load_timing(label: str, elapsed_s: float):
     try:
-        with open(_load_log_path(), "a", encoding="utf-8") as f:
-            f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} | {label}: {elapsed_s:.4f}s\n")
+        _atomic_append_line(
+            _load_log_path(),
+            f"{time.strftime('%Y-%m-%d %H:%M:%S')} | {label}: {elapsed_s:.4f}s\n",
+        )
     except Exception:
         pass
 
 
 def _log_load_info(label: str, message: str):
     try:
-        with open(_load_log_path(), "a", encoding="utf-8") as f:
-            f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} | {label}: {message}\n")
+        _atomic_append_line(
+            _load_log_path(),
+            f"{time.strftime('%Y-%m-%d %H:%M:%S')} | {label}: {message}\n",
+        )
     except Exception:
         pass
 
@@ -192,8 +223,7 @@ def _load_or_build_likelihoods():
     if os.path.exists(cache_path):
         try:
             t0 = time.perf_counter()
-            with open(cache_path, "rb") as f:
-                payload = pickle.load(f)
+            payload = _load_pickle_payload(cache_path)
             _log_load_timing("cache_read", time.perf_counter() - t0)
             if isinstance(payload, dict) and payload.get("version") == LIKELIHOOD_CACHE_VERSION:
                 print(f"[INFO] Loaded cached likelihoods from {os.path.basename(cache_path)}")
@@ -202,18 +232,39 @@ def _load_or_build_likelihoods():
         except Exception:
             pass
 
-    likelihood = _build_likelihoods_exact()
     try:
-        t0 = time.perf_counter()
-        with open(cache_path, "wb") as f:
-            pickle.dump(
+        with acquire_lease(
+            build_path_scope("pickle-file", cache_path),
+            f"oc-likelihood@pid{os.getpid()}",
+            ttl_sec=600.0,
+            heartbeat_sec=30.0,
+            wait_timeout_sec=300.0,
+        ) as lease:
+            if not lease.acquired:
+                raise TimeoutError(f"Timed out acquiring OC likelihood cache lease for {cache_path}")
+            if os.path.exists(cache_path):
+                try:
+                    t0 = time.perf_counter()
+                    payload = _load_pickle_payload(cache_path)
+                    _log_load_timing("cache_read", time.perf_counter() - t0)
+                    if isinstance(payload, dict) and payload.get("version") == LIKELIHOOD_CACHE_VERSION:
+                        print(f"[INFO] Loaded cached likelihoods from {os.path.basename(cache_path)}")
+                        _log_load_timing("load_or_build_total", time.perf_counter() - load_start)
+                        return payload["likelihoods"]
+                except Exception:
+                    pass
+            likelihood = _build_likelihoods_exact()
+            t0 = time.perf_counter()
+            atomic_write_pickle(
+                cache_path,
                 {"version": LIKELIHOOD_CACHE_VERSION, "likelihoods": likelihood},
-                f,
-                protocol=pickle.HIGHEST_PROTOCOL,
             )
-        _log_load_timing("cache_write", time.perf_counter() - t0)
+            _log_load_timing("cache_write", time.perf_counter() - t0)
+            _log_load_timing("load_or_build_total", time.perf_counter() - load_start)
+            return likelihood
     except Exception:
         pass
+    likelihood = _build_likelihoods_exact()
     _log_load_timing("load_or_build_total", time.perf_counter() - load_start)
     return likelihood
 
@@ -224,26 +275,37 @@ _LIKELIHOODS = None
 def _build_cache_file(force_rebuild: bool = False) -> str:
     """Build likelihoods and write cache file. Returns cache path."""
     cache_path = _likelihood_cache_path()
-    if os.path.exists(cache_path) and not force_rebuild:
-        print(f"[INFO] Cache already exists: {os.path.basename(cache_path)}")
-        _log_load_timing("build_cache_skipped_exists", 0.0)
-        return cache_path
-
-    t0 = time.perf_counter()
-    likelihood = _build_likelihoods_exact()
     try:
-        t1 = time.perf_counter()
-        with open(cache_path, "wb") as f:
-            pickle.dump(
-                {"version": LIKELIHOOD_CACHE_VERSION, "likelihoods": likelihood},
-                f,
-                protocol=pickle.HIGHEST_PROTOCOL,
-            )
-        print(f"[INFO] Wrote cache to {os.path.basename(cache_path)}")
-        _log_load_timing("cache_write", time.perf_counter() - t1)
+        with acquire_lease(
+            build_path_scope("pickle-file", cache_path),
+            f"oc-build-cache@pid{os.getpid()}",
+            ttl_sec=600.0,
+            heartbeat_sec=30.0,
+            wait_timeout_sec=300.0,
+        ) as lease:
+            if not lease.acquired:
+                raise TimeoutError(f"Timed out acquiring OC build cache lease for {cache_path}")
+            if os.path.exists(cache_path) and not force_rebuild:
+                print(f"[INFO] Cache already exists: {os.path.basename(cache_path)}")
+                _log_load_timing("build_cache_skipped_exists", 0.0)
+                return cache_path
+
+            t0 = time.perf_counter()
+            likelihood = _build_likelihoods_exact()
+            try:
+                t1 = time.perf_counter()
+                atomic_write_pickle(
+                    cache_path,
+                    {"version": LIKELIHOOD_CACHE_VERSION, "likelihoods": likelihood},
+                )
+                print(f"[INFO] Wrote cache to {os.path.basename(cache_path)}")
+                _log_load_timing("cache_write", time.perf_counter() - t1)
+            except Exception:
+                print("[WARN] Failed to write cache file.")
+            _log_load_timing("build_cache_total", time.perf_counter() - t0)
+            return cache_path
     except Exception:
-        print("[WARN] Failed to write cache file.")
-    _log_load_timing("build_cache_total", time.perf_counter() - t0)
+        pass
     return cache_path
 
 
@@ -280,8 +342,7 @@ def _load_first_suggestion() -> Optional[Tuple[int, int]]:
         _log_load_timing("first_suggestion_cache_miss", 0.0)
         return None
     try:
-        with open(cache_path, "rb") as f:
-            payload = pickle.load(f)
+        payload = _load_pickle_payload(cache_path)
         if isinstance(payload, dict) and payload.get("key") == _first_suggestion_cache_key():
             _log_load_timing("first_suggestion_cache_hit", 0.0)
             return payload.get("pos")
@@ -295,11 +356,18 @@ def _load_first_suggestion() -> Optional[Tuple[int, int]]:
 def _save_first_suggestion(pos: Tuple[int, int]):
     cache_path = _first_suggestion_cache_path()
     try:
-        with open(cache_path, "wb") as f:
-            pickle.dump(
+        with acquire_lease(
+            build_path_scope("pickle-file", cache_path),
+            f"oc-first-suggestion@pid{os.getpid()}",
+            ttl_sec=30.0,
+            heartbeat_sec=10.0,
+            wait_timeout_sec=5.0,
+        ) as lease:
+            if not lease.acquired:
+                raise TimeoutError(f"Timed out acquiring OC first suggestion lease for {cache_path}")
+            atomic_write_pickle(
+                cache_path,
                 {"key": _first_suggestion_cache_key(), "pos": pos},
-                f,
-                protocol=pickle.HIGHEST_PROTOCOL,
             )
     except Exception:
         pass
@@ -312,8 +380,7 @@ def _load_policy_cache() -> Dict:
         return {}
     try:
         t0 = time.perf_counter()
-        with open(cache_path, "rb") as f:
-            payload = pickle.load(f)
+        payload = _load_pickle_payload(cache_path)
         _log_load_timing("policy_cache_read", time.perf_counter() - t0)
         if isinstance(payload, dict) and payload.get("key") == _policy_cache_key():
             data = payload.get("cache") or {}
@@ -331,14 +398,32 @@ def _save_policy_cache(cache: Dict):
         return
     cache_path = _policy_cache_path()
     try:
-        t0 = time.perf_counter()
-        with open(cache_path, "wb") as f:
-            pickle.dump(
-                {"key": _policy_cache_key(), "cache": cache},
-                f,
-                protocol=pickle.HIGHEST_PROTOCOL,
+        with acquire_lease(
+            build_path_scope("pickle-file", cache_path),
+            f"oc-policy-cache@pid{os.getpid()}",
+            ttl_sec=30.0,
+            heartbeat_sec=10.0,
+            wait_timeout_sec=5.0,
+        ) as lease:
+            if not lease.acquired:
+                raise TimeoutError(f"Timed out acquiring OC policy cache lease for {cache_path}")
+            merged_cache = dict(cache)
+            if os.path.exists(cache_path):
+                try:
+                    payload = _load_pickle_payload(cache_path)
+                    if isinstance(payload, dict) and payload.get("key") == _policy_cache_key():
+                        existing = payload.get("cache")
+                        if isinstance(existing, dict):
+                            merged_cache = dict(existing)
+                            merged_cache.update(cache)
+                except Exception:
+                    pass
+            t0 = time.perf_counter()
+            atomic_write_pickle(
+                cache_path,
+                {"key": _policy_cache_key(), "cache": merged_cache},
             )
-        _log_load_timing("policy_cache_write", time.perf_counter() - t0)
+            _log_load_timing("policy_cache_write", time.perf_counter() - t0)
     except Exception:
         pass
 

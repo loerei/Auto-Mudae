@@ -19,6 +19,8 @@ from mudae.core import latency as Latency
 from mudae.discord import fetch as Fetch
 from mudae.paths import LOGS_DIR, OURO_CACHE_DIR, ensure_runtime_dirs
 from mudae.parsers.time_parser import _parse_discord_timestamp
+from mudae.storage.atomic import atomic_write_json
+from mudae.storage.coordination import acquire_lease, build_identity_scope, build_path_scope
 from mudae.storage.json_array_log import append_json_array, ensure_json_array_file
 from mudae.storage.latency_metrics import record_event as record_latency_event
 from mudae.ouro.Oq_solver import (
@@ -64,6 +66,8 @@ OQ_COOLDOWN_RE = re.compile(
     r"You don't have enough \$oq.*?Time to wait before the refill:\s*(.+)",
     re.IGNORECASE | re.DOTALL,
 )
+ACTION_LEASE_TTL_SEC = 180.0
+ACTION_LEASE_HEARTBEAT_SEC = 20.0
 
 
 @dataclass
@@ -554,20 +558,46 @@ def _load_emoji_learning_state(path: Path) -> Dict[str, Any]:
 def _save_emoji_learning_state(path: Path, payload: Dict[str, Any]) -> None:
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
-        to_write = {
-            "version": 1,
-            "higher_than_red_emojis": sorted(
-                _normalize_emoji_aliases(payload.get("higher_than_red_emojis", []))
-            ),
-        }
-        tmp_path = path.with_suffix(path.suffix + ".tmp")
-        tmp_path.write_text(
-            json.dumps(to_write, ensure_ascii=False, indent=2),
-            encoding="utf-8",
-        )
-        tmp_path.replace(path)
+        with acquire_lease(
+            build_path_scope("json-file", path),
+            f"oq-learning@pid{os.getpid()}",
+            ttl_sec=30.0,
+            heartbeat_sec=10.0,
+            wait_timeout_sec=5.0,
+        ) as lease:
+            if not lease.acquired:
+                raise TimeoutError(f"Timed out acquiring OQ learning lease for {path}")
+            current = _load_emoji_learning_state(path)
+            merged = _normalize_emoji_aliases(current.get("higher_than_red_emojis", []))
+            merged.update(_normalize_emoji_aliases(payload.get("higher_than_red_emojis", [])))
+            atomic_write_json(
+                path,
+                {
+                    "version": 1,
+                    "higher_than_red_emojis": sorted(merged),
+                },
+                ensure_ascii=False,
+                indent=2,
+            )
     except Exception:
         return
+
+
+def _acquire_action_lease(token: str, user_name: str):
+    scope, owner_label = build_identity_scope(
+        "mudae-action",
+        server_id=Vars.serverId,
+        channel_id=Vars.channelId,
+        token=token,
+        user_name=user_name,
+    )
+    return acquire_lease(
+        scope,
+        owner_label,
+        ttl_sec=ACTION_LEASE_TTL_SEC,
+        heartbeat_sec=ACTION_LEASE_HEARTBEAT_SEC,
+        wait_timeout_sec=0.0,
+    )
 
 
 def _map_emoji_to_obs(name: str) -> Optional[int]:
@@ -587,380 +617,391 @@ def _is_higher_than_red_emoji(name: str, higher_aliases: Set[str]) -> bool:
 def run_session(token: str, user_name: Optional[str] = None, quiet: bool = False) -> Dict[str, Any]:
     emit = _make_emitter(quiet)
     resolved_name = user_name or "Unknown"
-
-    bot = discum.Client(token=token, log=False)
-    auth = {"authorization": token}
-    url = _message_url()
-    base_url = _base_url()
-    command_sent_at: Optional[float] = None
-
-    _, pre_messages = Fetch.fetch_messages(url, auth, limit=1)
-    before_id = Fetch.get_latest_message_id(pre_messages)
-
-    try:
-        command_sent_at = time.perf_counter()
-        r = requests.post(url, headers=auth, data={"content": "$oq"}, timeout=Fetch.get_timeout())
-        _emit_latency("command_sent", action="oq_call")
+    lease = _acquire_action_lease(token, resolved_name)
+    if not lease.acquired:
         _log_event({
-            "type": "command",
-            "command": "$oq",
-            "status_code": r.status_code if r is not None else None,
+            "type": "busy",
+            "message": "Skipped $oq because another same-account action is already running",
             "user": resolved_name,
             "channel_id": Vars.channelId,
             "guild_id": Vars.serverId,
             "source": "Oq_bot",
         })
+        emit("Skipped $oq because another same-account action is already running.", "WARN")
+        return {"status": "busy", "reason": "same-account action already in progress"}
+
+    try:
+        bot = discum.Client(token=token, log=False)
+        auth = {"authorization": token}
+        url = _message_url()
+        base_url = _base_url()
+        command_sent_at: Optional[float] = None
+
+        _, pre_messages = Fetch.fetch_messages(url, auth, limit=1)
+        before_id = Fetch.get_latest_message_id(pre_messages)
+
         try:
-            payload = r.json() if r is not None else None
-        except Exception:
-            payload = None
-        if isinstance(payload, dict) and payload.get("id"):
-            before_id = str(payload.get("id"))
-    except Exception as exc:
-        _log_event({
-            "type": "error",
-            "error": f"Failed to send $oq: {exc}",
-            "source": "Oq_bot",
-        })
-        emit(f"Failed to send $oq: {exc}", "ERROR")
-        return {"status": "error", "error": str(exc)}
-
-    _, oq_message, cooldown_msg, cooldown_wait = _wait_for_oq_message(url, auth, after_id=before_id)
-    if cooldown_msg:
-        _log_event({
-            "type": "cooldown",
-            "message": "You don't have enough $oq for today",
-            "wait": cooldown_wait,
-            "message_id": str(cooldown_msg.get("id", "")),
-            "source": "Oq_bot",
-        })
-        if cooldown_wait:
-            emit(f"You don't have enough $oq for today. Time to wait before the refill: {cooldown_wait}", "WARN")
-        else:
-            emit("You don't have enough $oq for today.", "WARN")
-        return {"status": "cooldown", "wait": cooldown_wait}
-    if not oq_message:
-        _log_event({
-            "type": "error",
-            "error": "No $oq response detected",
-            "source": "Oq_bot",
-        })
-        emit("No $oq response detected.", "ERROR")
-        return {"status": "error", "error": "No $oq response detected"}
-    _emit_latency(
-        "message_detected",
-        action="oq_message",
-        response_ms=int((time.perf_counter() - command_sent_at) * 1000.0) if command_sent_at else None,
-        detect_lag_ms=_message_lag_ms(oq_message),
-    )
-
-    oq_message_id = str(oq_message.get("id", ""))
-    grid = _parse_grid(oq_message)
-    if not grid:
-        _log_event({
-            "type": "error",
-            "error": "Failed to parse $oq grid",
-            "message_id": oq_message_id,
-            "source": "Oq_bot",
-        })
-        emit("Failed to parse $oq grid.", "ERROR")
-        return {"status": "error", "error": "Failed to parse $oq grid"}
-
-    max_clicks, time_limit_sec = _parse_clicks_and_time(
-        oq_message.get("content", ""),
-        7,
-        120,
-    )
-
-    cache_ram_mb = int(getattr(Vars, "OQ_RAM_CACHE_MB", 512) or 512)
-    beam_k = int(getattr(Vars, "OQ_BEAM_K", OQ_BEAM_K_DEFAULT) or OQ_BEAM_K_DEFAULT)
-    cache_max_gb = float(getattr(Vars, "OQ_CACHE_MAX_GB", OQ_DEFAULT_CACHE_MAX_GB) or OQ_DEFAULT_CACHE_MAX_GB)
-    auto_learn_higher = _coerce_bool(getattr(Vars, "OQ_AUTO_LEARN_HIGHER_EMOJIS", True), True)
-    configured_higher_aliases = _normalize_emoji_aliases(getattr(Vars, "OQ_HIGHER_THAN_RED_EMOJIS", []))
-    configured_red_aliases = _normalize_emoji_aliases(getattr(Vars, "OQ_RED_EMOJI_ALIASES", []))
-    learning_state = _load_emoji_learning_state(OQ_EMOJI_LEARNING_FILE)
-    learned_higher_aliases = _normalize_emoji_aliases(learning_state.get("higher_than_red_emojis", []))
-    higher_than_red_aliases: Set[str] = set(configured_higher_aliases) | set(learned_higher_aliases)
-    red_aliases: Set[str] = set(configured_red_aliases)
-    warned_unknown_emojis: Set[str] = set()
-
-    _log_event({
-        "type": "session_start",
-        "user": resolved_name,
-        "channel_id": Vars.channelId,
-        "guild_id": Vars.serverId,
-        "message_id": oq_message_id,
-        "max_clicks": max_clicks,
-        "time_limit_sec": time_limit_sec,
-        "cache_ram_mb": cache_ram_mb,
-        "beam_k": beam_k,
-        "cache_max_gb": cache_max_gb,
-        "auto_learn_higher_emojis": auto_learn_higher,
-        "known_higher_emoji_aliases": sorted(higher_than_red_aliases),
-        "known_red_emoji_aliases": sorted(OQ_BASE_RED_EMOJIS | red_aliases),
-        "grid": _grid_snapshot(grid),
-        "source": "Oq_bot",
-    })
-
-    solver = OqSolver(
-        max_clicks=max_clicks,
-        cache_ram_mb=cache_ram_mb,
-        beam_k=beam_k,
-        cache_max_gb=cache_max_gb,
-    )
-    start_time = time.time()
-    red_pos: Optional[Tuple[int, int]] = None
-    post_red_mode = False
-    post_red_queue: List[int] = []
-
-    def _mark_generic_nonpurple(pos_idx: int) -> None:
-        if solver.is_revealed(pos_idx):
-            return
-        # Unknown OQ symbols still mean the tile is revealed and consumed a click.
-        solver.revealed_mask |= (1 << pos_idx)
-        solver.consume_click(1)
-
-    def _learn_higher_emoji(name: str, row: int, col: int) -> None:
-        if not auto_learn_higher:
-            return
-        if not name or name in higher_than_red_aliases:
-            return
-        higher_than_red_aliases.add(name)
-        learned_now = _normalize_emoji_aliases(learning_state.get("higher_than_red_emojis", []))
-        learned_now.add(name)
-        learning_state["higher_than_red_emojis"] = sorted(learned_now)
-        _save_emoji_learning_state(OQ_EMOJI_LEARNING_FILE, learning_state)
-        _log_event({
-            "type": "emoji_learned",
-            "emoji": name,
-            "category": "higher_than_red",
-            "row": row,
-            "col": col,
-            "source": "Oq_bot",
-        })
-        emit(f"Learned higher-than-red OQ emoji alias: {name}", "INFO")
-
-    def _update_solver_from_grid(current_grid: List[List[OqCell]]) -> None:
-        nonlocal red_pos
-        for row in current_grid:
-            for cell in row:
-                if cell.emoji == "spU":
-                    continue
-                if _is_red_emoji(cell.emoji, red_aliases):
-                    red_pos = (cell.row, cell.col)
-                    solver.note_red(rc_to_idx(cell.row, cell.col))
-                    continue
-                obs_code = _map_emoji_to_obs(cell.emoji)
-                if obs_code is None:
-                    pos_idx = rc_to_idx(cell.row, cell.col)
-                    if cell.clickable:
-                        if solver.found_purples >= TARGET_PURPLES and red_pos is None:
-                            # Some servers use non-standard emoji names for the self-revealed bonus sphere.
-                            # Treat an unknown clickable tile as the bonus target and click it first.
-                            red_pos = (cell.row, cell.col)
-                            if cell.emoji not in warned_unknown_emojis:
-                                warned_unknown_emojis.add(cell.emoji)
-                                _log_event({
-                                    "type": "info",
-                                    "message": "Unknown clickable reveal emoji treated as bonus sphere",
-                                    "emoji": cell.emoji,
-                                    "row": cell.row,
-                                    "col": cell.col,
-                                    "source": "Oq_bot",
-                                })
-                        continue
-                    treat_as_higher = (
-                        post_red_mode
-                        or solver.found_purples >= TARGET_PURPLES
-                        or _is_higher_than_red_emoji(cell.emoji, higher_than_red_aliases)
-                    )
-                    if treat_as_higher:
-                        if not _is_higher_than_red_emoji(cell.emoji, higher_than_red_aliases):
-                            _learn_higher_emoji(cell.emoji, cell.row, cell.col)
-                        _mark_generic_nonpurple(pos_idx)
-                        continue
-                    _mark_generic_nonpurple(pos_idx)
-                    if cell.emoji not in warned_unknown_emojis:
-                        warned_unknown_emojis.add(cell.emoji)
-                        _log_event({
-                            "type": "warn",
-                            "message": "Unknown emoji in grid (generic non-purple fallback)",
-                            "emoji": cell.emoji,
-                            "row": cell.row,
-                            "col": cell.col,
-                            "source": "Oq_bot",
-                        })
-                    continue
-                solver.apply_observation(rc_to_idx(cell.row, cell.col), obs_code)
-
-    _update_solver_from_grid(grid)
-
-    refresh_fail_streak = 0
-    while solver.clicks_left > 0:
-        if time.time() - start_time > time_limit_sec:
-            emit("Time limit reached.", "WARN")
-            break
-
-        oq_message = _fetch_oq_message_snapshot(url, base_url, auth, oq_message_id)
-        if not oq_message:
-            refresh_fail_streak += 1
-            emit("Failed to refresh $oq message. Retrying...", "WARN")
-            if refresh_fail_streak >= 3:
-                emit("Refresh failed too many times. Ending session.", "WARN")
-                break
-            _post_action_pause(0.5)
-            continue
-        refresh_fail_streak = 0
-
-        parsed_grid = _parse_grid(oq_message)
-        if parsed_grid:
-            grid = parsed_grid
-        _update_solver_from_grid(grid)
-
-        if solver.clicks_left <= 0:
-            break
-
-        forced_red = False
-        target_cell = None
-        target_r = None
-        target_c = None
-
-        if post_red_mode:
-            while post_red_queue:
-                pos_idx = post_red_queue.pop(0)
-                rr, cc = idx_to_rc(pos_idx)
-                if 0 <= rr < len(grid) and 0 <= cc < len(grid[0]):
-                    candidate = grid[rr][cc]
-                    if candidate.clickable:
-                        target_cell = candidate
-                        target_r, target_c = rr, cc
-                        break
-            if target_cell is None:
-                emit("No clickable tiles left.", "WARN")
-                break
-        else:
-            if red_pos is not None:
-                rr, cc = red_pos
-                if 0 <= rr < len(grid) and 0 <= cc < len(grid[0]):
-                    candidate = grid[rr][cc]
-                    if candidate.clickable:
-                        target_cell = candidate
-                        target_r, target_c = candidate.row, candidate.col
-                        forced_red = True
-
-            if target_cell is None:
-                if solver.found_purples >= TARGET_PURPLES and red_pos is None:
-                    _post_action_pause(0.4)
-                    continue
-                suggestion = solver.pick_next_click()
-                if suggestion is not None:
-                    target_r, target_c = idx_to_rc(suggestion)
-
-            if target_cell is None and target_r is not None and target_c is not None:
-                if 0 <= target_r < len(grid) and 0 <= target_c < len(grid[0]):
-                    candidate = grid[target_r][target_c]
-                    if candidate.clickable:
-                        target_cell = candidate
-
-            if target_cell is None:
-                clickable_cells = [cell for row in grid for cell in row if cell.clickable]
-                if not clickable_cells:
-                    emit("No clickable tiles left.", "WARN")
-                    break
-                target_cell = clickable_cells[0]
-                target_r, target_c = target_cell.row, target_cell.col
-
-        # click
-        click_sent_at = time.perf_counter()
-        _emit_latency(
-            "action_sent",
-            action="oq_click",
-            click_index=solver.clicks_used + 1,
-            row=target_r,
-            col=target_c,
-        )
-        bot.click(
-            Vars.MUDAE_BOT_ID,
-            channelID=Vars.channelId,
-            guildID=Vars.serverId,
-            messageID=oq_message_id,
-            messageFlags=int(oq_message.get("flags", 0) or 0),
-            data={"component_type": 2, "custom_id": target_cell.custom_id},
-        )
-
-        if forced_red:
-            solver.consume_click(1)
-            post_red_mode = True
-            post_red_queue = solver.post_red_click_order()
-
-        _post_action_pause(0.4)
-        oq_message = _fetch_oq_message_snapshot(url, base_url, auth, oq_message_id) or oq_message
-        parsed_grid = _parse_grid(oq_message)
-        if parsed_grid:
-            grid = parsed_grid
-        _update_solver_from_grid(grid)
-
-        observed_code: Optional[Any] = None
-        if target_r is not None and target_c is not None:
-            if 0 <= target_r < len(grid) and 0 <= target_c < len(grid[0]):
-                target_emoji = grid[target_r][target_c].emoji
-                if _is_red_emoji(target_emoji, red_aliases):
-                    observed_code = "RED"
-                else:
-                    mapped = _map_emoji_to_obs(target_emoji)
-                    if mapped is not None:
-                        observed_code = mapped
-                    elif _is_higher_than_red_emoji(target_emoji, higher_than_red_aliases):
-                        observed_code = "HIGH"
-                    else:
-                        observed_code = "UNKNOWN"
-
-        if not quiet and target_r is not None and target_c is not None:
-            emit(
-                f"Click {solver.clicks_used}/{max_clicks}: ({target_r+1},{target_c+1}) "
-                f"obs={observed_code} purples={solver.found_purples}"
-            )
-
-        if target_r is not None and target_c is not None:
+            command_sent_at = time.perf_counter()
+            r = requests.post(url, headers=auth, data={"content": "$oq"}, timeout=Fetch.get_timeout())
+            _emit_latency("command_sent", action="oq_call")
             _log_event({
-                "type": "click",
-                "click_index": solver.clicks_used,
-                "row": target_r,
-                "col": target_c,
-                "emoji": grid[target_r][target_c].emoji if grid else None,
-                "observed_code": observed_code,
-                "found_purples": solver.found_purples,
+                "type": "command",
+                "command": "$oq",
+                "status_code": r.status_code if r is not None else None,
+                "user": resolved_name,
+                "channel_id": Vars.channelId,
+                "guild_id": Vars.serverId,
                 "source": "Oq_bot",
             })
+            try:
+                payload = r.json() if r is not None else None
+            except Exception:
+                payload = None
+            if isinstance(payload, dict) and payload.get("id"):
+                before_id = str(payload.get("id"))
+        except Exception as exc:
+            _log_event({
+                "type": "error",
+                "error": f"Failed to send $oq: {exc}",
+                "source": "Oq_bot",
+            })
+            emit(f"Failed to send $oq: {exc}", "ERROR")
+            return {"status": "error", "error": str(exc)}
+
+        _, oq_message, cooldown_msg, cooldown_wait = _wait_for_oq_message(url, auth, after_id=before_id)
+        if cooldown_msg:
+            _log_event({
+                "type": "cooldown",
+                "message": "You don't have enough $oq for today",
+                "wait": cooldown_wait,
+                "message_id": str(cooldown_msg.get("id", "")),
+                "source": "Oq_bot",
+            })
+            if cooldown_wait:
+                emit(f"You don't have enough $oq for today. Time to wait before the refill: {cooldown_wait}", "WARN")
+            else:
+                emit("You don't have enough $oq for today.", "WARN")
+            return {"status": "cooldown", "wait": cooldown_wait}
+        if not oq_message:
+            _log_event({
+                "type": "error",
+                "error": "No $oq response detected",
+                "source": "Oq_bot",
+            })
+            emit("No $oq response detected.", "ERROR")
+            return {"status": "error", "error": "No $oq response detected"}
         _emit_latency(
-            "action_ack",
-            action="oq_click",
-            click_index=solver.clicks_used,
-            response_ms=int((time.perf_counter() - click_sent_at) * 1000.0),
+            "message_detected",
+            action="oq_message",
+            response_ms=int((time.perf_counter() - command_sent_at) * 1000.0) if command_sent_at else None,
             detect_lag_ms=_message_lag_ms(oq_message),
         )
 
-        if forced_red:
-            emit("Red sphere clicked. Switching to score clicks.", "INFO")
+        oq_message_id = str(oq_message.get("id", ""))
+        grid = _parse_grid(oq_message)
+        if not grid:
+            _log_event({
+                "type": "error",
+                "error": "Failed to parse $oq grid",
+                "message_id": oq_message_id,
+                "source": "Oq_bot",
+            })
+            emit("Failed to parse $oq grid.", "ERROR")
+            return {"status": "error", "error": "Failed to parse $oq grid"}
 
-    _log_event({
-        "type": "session_end",
-        "user": resolved_name,
-        "message_id": oq_message_id,
-        "clicks_used": solver.clicks_used,
-        "found_purples": solver.found_purples,
-        "source": "Oq_bot",
-    })
+        max_clicks, time_limit_sec = _parse_clicks_and_time(
+            oq_message.get("content", ""),
+            7,
+            120,
+        )
 
-    if not quiet:
-        emit("Session complete.")
+        cache_ram_mb = int(getattr(Vars, "OQ_RAM_CACHE_MB", 512) or 512)
+        beam_k = int(getattr(Vars, "OQ_BEAM_K", OQ_BEAM_K_DEFAULT) or OQ_BEAM_K_DEFAULT)
+        cache_max_gb = float(getattr(Vars, "OQ_CACHE_MAX_GB", OQ_DEFAULT_CACHE_MAX_GB) or OQ_DEFAULT_CACHE_MAX_GB)
+        auto_learn_higher = _coerce_bool(getattr(Vars, "OQ_AUTO_LEARN_HIGHER_EMOJIS", True), True)
+        configured_higher_aliases = _normalize_emoji_aliases(getattr(Vars, "OQ_HIGHER_THAN_RED_EMOJIS", []))
+        configured_red_aliases = _normalize_emoji_aliases(getattr(Vars, "OQ_RED_EMOJI_ALIASES", []))
+        learning_state = _load_emoji_learning_state(OQ_EMOJI_LEARNING_FILE)
+        learned_higher_aliases = _normalize_emoji_aliases(learning_state.get("higher_than_red_emojis", []))
+        higher_than_red_aliases: Set[str] = set(configured_higher_aliases) | set(learned_higher_aliases)
+        red_aliases: Set[str] = set(configured_red_aliases)
+        warned_unknown_emojis: Set[str] = set()
 
-    return {
-        "status": "ok",
-        "clicks_used": solver.clicks_used,
-        "found_purples": solver.found_purples,
-        "message_id": oq_message_id,
-    }
+        _log_event({
+            "type": "session_start",
+            "user": resolved_name,
+            "channel_id": Vars.channelId,
+            "guild_id": Vars.serverId,
+            "message_id": oq_message_id,
+            "max_clicks": max_clicks,
+            "time_limit_sec": time_limit_sec,
+            "cache_ram_mb": cache_ram_mb,
+            "beam_k": beam_k,
+            "cache_max_gb": cache_max_gb,
+            "auto_learn_higher_emojis": auto_learn_higher,
+            "known_higher_emoji_aliases": sorted(higher_than_red_aliases),
+            "known_red_emoji_aliases": sorted(OQ_BASE_RED_EMOJIS | red_aliases),
+            "grid": _grid_snapshot(grid),
+            "source": "Oq_bot",
+        })
+
+        solver = OqSolver(
+            max_clicks=max_clicks,
+            cache_ram_mb=cache_ram_mb,
+            beam_k=beam_k,
+            cache_max_gb=cache_max_gb,
+        )
+        start_time = time.time()
+        red_pos: Optional[Tuple[int, int]] = None
+        post_red_mode = False
+        post_red_queue: List[int] = []
+
+        def _mark_generic_nonpurple(pos_idx: int) -> None:
+            if solver.is_revealed(pos_idx):
+                return
+            solver.revealed_mask |= (1 << pos_idx)
+            solver.consume_click(1)
+
+        def _learn_higher_emoji(name: str, row: int, col: int) -> None:
+            if not auto_learn_higher:
+                return
+            if not name or name in higher_than_red_aliases:
+                return
+            higher_than_red_aliases.add(name)
+            learned_now = _normalize_emoji_aliases(learning_state.get("higher_than_red_emojis", []))
+            learned_now.add(name)
+            learning_state["higher_than_red_emojis"] = sorted(learned_now)
+            _save_emoji_learning_state(OQ_EMOJI_LEARNING_FILE, learning_state)
+            _log_event({
+                "type": "emoji_learned",
+                "emoji": name,
+                "category": "higher_than_red",
+                "row": row,
+                "col": col,
+                "source": "Oq_bot",
+            })
+            emit(f"Learned higher-than-red OQ emoji alias: {name}", "INFO")
+
+        def _update_solver_from_grid(current_grid: List[List[OqCell]]) -> None:
+            nonlocal red_pos
+            for row in current_grid:
+                for cell in row:
+                    if cell.emoji == "spU":
+                        continue
+                    if _is_red_emoji(cell.emoji, red_aliases):
+                        red_pos = (cell.row, cell.col)
+                        solver.note_red(rc_to_idx(cell.row, cell.col))
+                        continue
+                    obs_code = _map_emoji_to_obs(cell.emoji)
+                    if obs_code is None:
+                        pos_idx = rc_to_idx(cell.row, cell.col)
+                        if cell.clickable:
+                            if solver.found_purples >= TARGET_PURPLES and red_pos is None:
+                                red_pos = (cell.row, cell.col)
+                                if cell.emoji not in warned_unknown_emojis:
+                                    warned_unknown_emojis.add(cell.emoji)
+                                    _log_event({
+                                        "type": "info",
+                                        "message": "Unknown clickable reveal emoji treated as bonus sphere",
+                                        "emoji": cell.emoji,
+                                        "row": cell.row,
+                                        "col": cell.col,
+                                        "source": "Oq_bot",
+                                    })
+                            continue
+                        treat_as_higher = (
+                            post_red_mode
+                            or solver.found_purples >= TARGET_PURPLES
+                            or _is_higher_than_red_emoji(cell.emoji, higher_than_red_aliases)
+                        )
+                        if treat_as_higher:
+                            if not _is_higher_than_red_emoji(cell.emoji, higher_than_red_aliases):
+                                _learn_higher_emoji(cell.emoji, cell.row, cell.col)
+                            _mark_generic_nonpurple(pos_idx)
+                            continue
+                        _mark_generic_nonpurple(pos_idx)
+                        if cell.emoji not in warned_unknown_emojis:
+                            warned_unknown_emojis.add(cell.emoji)
+                            _log_event({
+                                "type": "warn",
+                                "message": "Unknown emoji in grid (generic non-purple fallback)",
+                                "emoji": cell.emoji,
+                                "row": cell.row,
+                                "col": cell.col,
+                                "source": "Oq_bot",
+                            })
+                        continue
+                    solver.apply_observation(rc_to_idx(cell.row, cell.col), obs_code)
+
+        _update_solver_from_grid(grid)
+
+        refresh_fail_streak = 0
+        while solver.clicks_left > 0:
+            if time.time() - start_time > time_limit_sec:
+                emit("Time limit reached.", "WARN")
+                break
+
+            oq_message = _fetch_oq_message_snapshot(url, base_url, auth, oq_message_id)
+            if not oq_message:
+                refresh_fail_streak += 1
+                emit("Failed to refresh $oq message. Retrying...", "WARN")
+                if refresh_fail_streak >= 3:
+                    emit("Refresh failed too many times. Ending session.", "WARN")
+                    break
+                _post_action_pause(0.5)
+                continue
+            refresh_fail_streak = 0
+
+            parsed_grid = _parse_grid(oq_message)
+            if parsed_grid:
+                grid = parsed_grid
+            _update_solver_from_grid(grid)
+
+            if solver.clicks_left <= 0:
+                break
+
+            forced_red = False
+            target_cell = None
+            target_r = None
+            target_c = None
+
+            if post_red_mode:
+                while post_red_queue:
+                    pos_idx = post_red_queue.pop(0)
+                    rr, cc = idx_to_rc(pos_idx)
+                    if 0 <= rr < len(grid) and 0 <= cc < len(grid[0]):
+                        candidate = grid[rr][cc]
+                        if candidate.clickable:
+                            target_cell = candidate
+                            target_r, target_c = rr, cc
+                            break
+                if target_cell is None:
+                    emit("No clickable tiles left.", "WARN")
+                    break
+            else:
+                if red_pos is not None:
+                    rr, cc = red_pos
+                    if 0 <= rr < len(grid) and 0 <= cc < len(grid[0]):
+                        candidate = grid[rr][cc]
+                        if candidate.clickable:
+                            target_cell = candidate
+                            target_r, target_c = candidate.row, candidate.col
+                            forced_red = True
+
+                if target_cell is None:
+                    if solver.found_purples >= TARGET_PURPLES and red_pos is None:
+                        _post_action_pause(0.4)
+                        continue
+                    suggestion = solver.pick_next_click()
+                    if suggestion is not None:
+                        target_r, target_c = idx_to_rc(suggestion)
+
+                if target_cell is None and target_r is not None and target_c is not None:
+                    if 0 <= target_r < len(grid) and 0 <= target_c < len(grid[0]):
+                        candidate = grid[target_r][target_c]
+                        if candidate.clickable:
+                            target_cell = candidate
+
+                if target_cell is None:
+                    clickable_cells = [cell for row in grid for cell in row if cell.clickable]
+                    if not clickable_cells:
+                        emit("No clickable tiles left.", "WARN")
+                        break
+                    target_cell = clickable_cells[0]
+                    target_r, target_c = target_cell.row, target_cell.col
+
+            click_sent_at = time.perf_counter()
+            _emit_latency(
+                "action_sent",
+                action="oq_click",
+                click_index=solver.clicks_used + 1,
+                row=target_r,
+                col=target_c,
+            )
+            bot.click(
+                Vars.MUDAE_BOT_ID,
+                channelID=Vars.channelId,
+                guildID=Vars.serverId,
+                messageID=oq_message_id,
+                messageFlags=int(oq_message.get("flags", 0) or 0),
+                data={"component_type": 2, "custom_id": target_cell.custom_id},
+            )
+
+            if forced_red:
+                solver.consume_click(1)
+                post_red_mode = True
+                post_red_queue = solver.post_red_click_order()
+
+            _post_action_pause(0.4)
+            oq_message = _fetch_oq_message_snapshot(url, base_url, auth, oq_message_id) or oq_message
+            parsed_grid = _parse_grid(oq_message)
+            if parsed_grid:
+                grid = parsed_grid
+            _update_solver_from_grid(grid)
+
+            observed_code: Optional[Any] = None
+            if target_r is not None and target_c is not None:
+                if 0 <= target_r < len(grid) and 0 <= target_c < len(grid[0]):
+                    target_emoji = grid[target_r][target_c].emoji
+                    if _is_red_emoji(target_emoji, red_aliases):
+                        observed_code = "RED"
+                    else:
+                        mapped = _map_emoji_to_obs(target_emoji)
+                        if mapped is not None:
+                            observed_code = mapped
+                        elif _is_higher_than_red_emoji(target_emoji, higher_than_red_aliases):
+                            observed_code = "HIGH"
+                        else:
+                            observed_code = "UNKNOWN"
+
+            if not quiet and target_r is not None and target_c is not None:
+                emit(
+                    f"Click {solver.clicks_used}/{max_clicks}: ({target_r+1},{target_c+1}) "
+                    f"obs={observed_code} purples={solver.found_purples}"
+                )
+
+            if target_r is not None and target_c is not None:
+                _log_event({
+                    "type": "click",
+                    "click_index": solver.clicks_used,
+                    "row": target_r,
+                    "col": target_c,
+                    "emoji": grid[target_r][target_c].emoji if grid else None,
+                    "observed_code": observed_code,
+                    "found_purples": solver.found_purples,
+                    "source": "Oq_bot",
+                })
+            _emit_latency(
+                "action_ack",
+                action="oq_click",
+                click_index=solver.clicks_used,
+                response_ms=int((time.perf_counter() - click_sent_at) * 1000.0),
+                detect_lag_ms=_message_lag_ms(oq_message),
+            )
+
+            if forced_red:
+                emit("Red sphere clicked. Switching to score clicks.", "INFO")
+
+        _log_event({
+            "type": "session_end",
+            "user": resolved_name,
+            "message_id": oq_message_id,
+            "clicks_used": solver.clicks_used,
+            "found_purples": solver.found_purples,
+            "source": "Oq_bot",
+        })
+
+        if not quiet:
+            emit("Session complete.")
+
+        return {
+            "status": "ok",
+            "clicks_used": solver.clicks_used,
+            "found_purples": solver.found_purples,
+            "message_id": oq_message_id,
+        }
+    finally:
+        lease.release()
 
 
 def main() -> None:
