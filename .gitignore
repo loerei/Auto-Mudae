@@ -1,0 +1,29 @@
+# Python cache/artifacts
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.so
+*.bak
+
+# Virtual environments
+.venv/
+.portable/
+
+# Tool caches
+.pytest_cache/
+
+# Runtime/generated workspace data
+cache/
+archive/
+config/*.json
+!config/*.example.json
+
+# Runtime logs and outputs
+logs/*
+!logs/.gitkeep
+
+
+.fake
+.env
+config.env

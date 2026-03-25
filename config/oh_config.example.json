@@ -1,0 +1,50 @@
+{
+  "emoji_map": {
+    "spU": "HIDDEN",
+    "spB": "BLUE",
+    "spT": "TEAL",
+    "spG": "GREEN",
+    "spY": "YELLOW",
+    "spO": "ORANGE",
+    "spR": "RED",
+    "spP": "PURPLE",
+    "sp": "RAINBOW",
+    "spL": "LIGHT",
+    "spD": "DARK"
+  },
+  "values": {
+    "PURPLE": 5,
+    "BLUE": 10,
+    "TEAL": 20,
+    "GREEN": 35,
+    "YELLOW": 55,
+    "ORANGE": 90,
+    "RED": 150,
+    "RAINBOW": 500,
+    "HIDDEN": 0
+  },
+  "reveal_counts": {
+    "BLUE": 3,
+    "TEAL": 1
+  },
+  "expected_values": {
+    "LIGHT": null,
+    "DARK": null,
+    "HIDDEN": 0
+  },
+  "prior_weights": {
+    "PURPLE": 1,
+    "BLUE": 1,
+    "TEAL": 1,
+    "GREEN": 1,
+    "YELLOW": 1,
+    "ORANGE": 1,
+    "RED": 1,
+    "RAINBOW": 1,
+    "LIGHT": 1,
+    "DARK": 1,
+    "HIDDEN": 1
+  },
+  "monte_carlo_samples": 64,
+  "time_limit_sec": 120
+}

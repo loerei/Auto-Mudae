@@ -1,0 +1,2 @@
+"""Discord API helper package."""
+

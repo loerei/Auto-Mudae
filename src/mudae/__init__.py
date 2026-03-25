@@ -1,0 +1,2 @@
+"""Mudae bot package."""
+
