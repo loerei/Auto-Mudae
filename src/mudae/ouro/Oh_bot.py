@@ -336,6 +336,23 @@ def _parse_reward_content(content: str, emoji_map: Dict[str, str]) -> Dict[str, 
     }
 
 
+def _resolve_final_click_color(observed_color: Optional[str], reward_info: Optional[Dict[str, Any]]) -> str:
+    if isinstance(reward_info, dict):
+        resolved_color = reward_info.get("resolved_color")
+        if isinstance(resolved_color, str) and resolved_color:
+            return resolved_color
+        reward_color = reward_info.get("reward_color")
+        if isinstance(reward_color, str) and reward_color:
+            return reward_color
+    if isinstance(observed_color, str) and observed_color:
+        return observed_color
+    return "UNKNOWN"
+
+
+def _click_consumes_turn(final_color: Optional[str]) -> bool:
+    return str(final_color or "").strip().upper() != "PURPLE"
+
+
 def _fetch_latest_reward_message(url: str, auth: Dict[str, str]) -> Optional[Dict[str, Any]]:
     response, messages = Fetch.fetch_messages(url, auth, limit=10)
     if response is None or not messages:
@@ -704,6 +721,7 @@ def run_session(token: str, user_name: Optional[str] = None, quiet: bool = False
     max_clicks = 5
     time_limit_sec = cfg.time_limit_sec
     clicks_used = 0
+    picks_made = 0
     revealed_positions: Dict[Tuple[int, int], str] = {}
     color_counts_delta: Dict[str, int] = {}
     reward_processed_counts: Dict[str, int] = {}
@@ -945,11 +963,12 @@ def run_session(token: str, user_name: Optional[str] = None, quiet: bool = False
             reward_msg_id_before = str(reward_msg.get("id")) if reward_msg else None
 
             # click
+            pick_index = picks_made + 1
             click_sent_at = time.perf_counter()
             _emit_latency(
                 "action_sent",
                 action="oh_click",
-                click_index=clicks_used + 1,
+                click_index=pick_index,
                 row=best_pos[0],
                 col=best_pos[1],
             )
@@ -993,6 +1012,8 @@ def run_session(token: str, user_name: Optional[str] = None, quiet: bool = False
             )
 
             resolved_color = reward_info.get("resolved_color") or reward_info.get("reward_color")
+            final_color = _resolve_final_click_color(observed_color, reward_info)
+            consumes_turn = _click_consumes_turn(final_color)
             if resolved_color and observed_color != resolved_color and updated_cell:
                 # adjust counts if we already counted observed reveal
                 if (updated_cell.row, updated_cell.col) in revealed_positions:
@@ -1008,7 +1029,8 @@ def run_session(token: str, user_name: Optional[str] = None, quiet: bool = False
             reward_lines: List[Dict[str, Any]] = []
             reward_stock: Optional[int] = None
             max_reward_attempts = 4
-            need_stock = (clicks_used + 1) >= max_clicks
+            next_clicks_used = clicks_used + (1 if consumes_turn else 0)
+            need_stock = next_clicks_used >= max_clicks
             for attempt in range(max_reward_attempts):
                 reward_messages = _fetch_reward_messages(url, auth, limit=15)
                 delta, new_entries, stock, latest_msg = _collect_reward_delta(
@@ -1033,13 +1055,13 @@ def run_session(token: str, user_name: Optional[str] = None, quiet: bool = False
                     "type": "warn",
                     "message": "reward not detected",
                     "message_id": oh_message_id,
-                    "click_index": clicks_used + 1,
+                    "click_index": pick_index,
                     "source": "Oh_bot",
                 })
             _emit_latency(
                 "action_ack",
                 action="oh_click",
-                click_index=clicks_used + 1,
+                click_index=pick_index,
                 response_ms=int((time.perf_counter() - click_sent_at) * 1000.0),
                 detect_lag_ms=_message_lag_ms(oh_message),
                 reward_delta=reward_delta,
@@ -1047,11 +1069,14 @@ def run_session(token: str, user_name: Optional[str] = None, quiet: bool = False
 
             _log_event({
                 "type": "click",
-                "click_index": clicks_used + 1,
+                "click_index": pick_index,
                 "row": best_pos[0],
                 "col": best_pos[1],
                 "emoji": grid.cells[best_pos[0]][best_pos[1]].emoji if grid else None,
                 "observed_color": observed_color,
+                "final_color": final_color,
+                "resolved_color": resolved_color,
+                "consumes_turn": consumes_turn,
                 "action": action,
                 "ev_exploit": ev_exploit,
                 "ev_explore": ev_explore,
@@ -1062,14 +1087,17 @@ def run_session(token: str, user_name: Optional[str] = None, quiet: bool = False
                 "source": "Oh_bot",
             })
 
-            clicks_used += 1
+            picks_made = pick_index
+            clicks_used = next_clicks_used
 
             if not quiet:
                 reward_text = f"+{reward_delta}" if reward_delta else "+0"
                 stock_text = f" | Stock {reward_stock}" if reward_stock is not None else ""
                 emit(
-                    f"Click {clicks_used}/{max_clicks}: ({best_pos[0]+1},{best_pos[1]+1}) "
-                    f"observed={observed_color} | gain {reward_text} | total {session_total}{stock_text}"
+                    f"Pick {pick_index} | turns {clicks_used}/{max_clicks}: ({best_pos[0]+1},{best_pos[1]+1}) "
+                    f"observed={observed_color} | final={final_color} | "
+                    f"{'consumed turn' if consumes_turn else 'extra turn kept'} | "
+                    f"gain {reward_text} | total {session_total}{stock_text}"
                 )
 
         _log_event({
@@ -1077,6 +1105,7 @@ def run_session(token: str, user_name: Optional[str] = None, quiet: bool = False
             "user": resolved_name,
             "message_id": oh_message_id,
             "clicks_used": clicks_used,
+            "picks_made": picks_made,
             "total_reward": session_total,
             "color_counts_delta": color_counts_delta,
             "final_stock": last_stock,
@@ -1095,6 +1124,7 @@ def run_session(token: str, user_name: Optional[str] = None, quiet: bool = False
         return {
             "status": "ok",
             "clicks_used": clicks_used,
+            "picks_made": picks_made,
             "total_reward": session_total,
             "final_stock": last_stock,
             "message_id": oh_message_id,
@@ -1113,6 +1143,7 @@ def run_session(token: str, user_name: Optional[str] = None, quiet: bool = False
                 "user": resolved_name,
                 "message_id": oh_message_id,
                 "clicks_used": clicks_used,
+                "picks_made": picks_made,
                 "total_reward": session_total,
                 "color_counts_delta": color_counts_delta,
                 "final_stock": last_stock,
