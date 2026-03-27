@@ -82,7 +82,7 @@ def _no_reset_retry_delay_seconds(failures: int) -> int:
 
 
 def _sleep_with_control(seconds: float, control: ControlReader, *, token: Optional[str] = None) -> str:
-    from mudae.core.session_engine import pollExternalRolls
+    from mudae.core.session_engine import maybe_run_scheduled_transfers, pollExternalRolls
 
     end_time = time.time() + max(0.0, seconds)
     last_poll = 0.0
@@ -94,6 +94,10 @@ def _sleep_with_control(seconds: float, control: ControlReader, *, token: Option
             last_poll = time.time()
             try:
                 pollExternalRolls(token)
+            except Exception:
+                pass
+            try:
+                maybe_run_scheduled_transfers(token)
             except Exception:
                 pass
         time.sleep(0.25)

@@ -60,6 +60,7 @@ Latency.configure_from_vars()
 # Session log file (will be per-user)
 SESSION_LOG_FILE = os.fspath(LOGS_DIR / 'Session.log')
 CLAIM_STATS_FILE = os.fspath(CONFIG_DIR / 'claim_stats.json')
+AUTO_GIVE_STATE_FILE = os.fspath(CONFIG_DIR / 'auto_give_state.json')
 
 # Store current user info during session
 current_user_id: Optional[str] = None
@@ -95,6 +96,8 @@ _session_start_epoch: Dict[str, float] = {}
 _processed_manual_claim_ids: Dict[str, Set[str]] = {}
 _active_session_log_file: Optional[str] = None
 _active_session_rawresponse_file: Optional[str] = None
+_auto_give_seen_keys: Set[str] = set()
+_auto_give_seen_lock = threading.Lock()
 
 def setStopRequested(value: bool) -> None:
     """Allow Bot to signal a stop request for faster interrupts."""
@@ -442,6 +445,42 @@ def _get_cached_wishlist(token: str, max_age_sec: Optional[float] = None) -> Opt
         except (TypeError, ValueError):
             pass
     return copy.deepcopy(cached)
+
+
+def _apply_cached_tu_updates(
+    token: str,
+    tu_info: Optional[Dict[str, Any]],
+    **updates: Any,
+) -> Optional[Dict[str, Any]]:
+    base = dict(tu_info) if tu_info else _get_cached_tu_info(token)
+    if not base:
+        return tu_info
+    base.update(updates)
+    _cache_tu_info(token, base)
+    if token in initial_tu_cache:
+        initial_tu_cache[token] = dict(base)
+    _dashboard_set_status(base)
+    return base
+
+
+def _synthesize_tu_after_dk(token: str, tu_info: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    max_power = getMaxPowerForToken(token)
+    return _apply_cached_tu_updates(
+        token,
+        tu_info,
+        current_power=max_power,
+        max_power=max_power,
+        dk_ready=False,
+    )
+
+
+def _synthesize_tu_after_rt(token: str, tu_info: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    return _apply_cached_tu_updates(
+        token,
+        tu_info,
+        can_claim_now=True,
+        rt_available=False,
+    )
 
 def _merge_tu_info(primary: Optional[Dict[str, Any]], fallback: Optional[Dict[str, Any]]) -> Dict[str, Any]:
     merged: Dict[str, Any] = {}
@@ -1638,6 +1677,362 @@ def _send_text_command(
     return response.status_code == 200
 
 
+def _resolve_give_target_id(pairs: List[Tuple[int, int]], source_id: int) -> Optional[int]:
+    for src, dst in pairs:
+        if src == source_id:
+            return dst
+    return None
+
+
+def _auto_give_hour_bucket(now_ts: float) -> str:
+    return time.strftime("%Y-%m-%d %H", time.localtime(now_ts))
+
+
+def _auto_give_entry_key(source_id: int, resource: str, bucket: str) -> str:
+    return f"{bucket}|{source_id}|{resource}"
+
+
+def _mark_auto_give_seen(*keys: str) -> None:
+    clean = [key for key in keys if key]
+    if not clean:
+        return
+    with _auto_give_seen_lock:
+        _auto_give_seen_keys.update(clean)
+
+
+def _is_auto_give_seen(key: str) -> bool:
+    if not key:
+        return False
+    with _auto_give_seen_lock:
+        return key in _auto_give_seen_keys
+
+
+def _load_auto_give_state() -> Dict[str, Any]:
+    try:
+        with open(AUTO_GIVE_STATE_FILE, 'r', encoding='utf-8') as handle:
+            payload = json.load(handle)
+    except FileNotFoundError:
+        payload = {}
+    except Exception:
+        payload = {}
+    if not isinstance(payload, dict):
+        payload = {}
+    entries = payload.get("entries")
+    if not isinstance(entries, dict):
+        payload["entries"] = {}
+    return payload
+
+
+def _save_auto_give_state(payload: Dict[str, Any]) -> None:
+    normalized = payload if isinstance(payload, dict) else {}
+    entries = normalized.get("entries")
+    if not isinstance(entries, dict):
+        normalized = dict(normalized)
+        normalized["entries"] = {}
+    os.makedirs(os.path.dirname(AUTO_GIVE_STATE_FILE), exist_ok=True)
+    temp_path = f"{AUTO_GIVE_STATE_FILE}.{os.getpid()}.{threading.get_ident()}.tmp"
+    with open(temp_path, 'w', encoding='utf-8') as handle:
+        json.dump(normalized, handle, indent=2, ensure_ascii=False)
+    os.replace(temp_path, AUTO_GIVE_STATE_FILE)
+
+
+def _build_auto_give_entry(
+    *,
+    bucket: str,
+    source_id: int,
+    resource: str,
+    status: str,
+    amount: int,
+    now_ts: float,
+    target_id: Optional[int] = None,
+    note: Optional[str] = None,
+) -> Dict[str, Any]:
+    entry: Dict[str, Any] = {
+        "bucket": bucket,
+        "source_id": source_id,
+        "resource": resource,
+        "status": status,
+        "amount": int(amount),
+        "updated_at": time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(now_ts)),
+    }
+    if target_id is not None:
+        entry["target_id"] = int(target_id)
+    if note:
+        entry["note"] = str(note)
+    return entry
+
+
+def maybe_run_scheduled_transfers(token: str, now: Optional[float] = None) -> None:
+    if not token:
+        return
+    source_id = _get_token_config_id(token)
+    if source_id is None:
+        return
+    now_ts = time.time() if now is None else float(now)
+    if time.localtime(now_ts).tm_min != 20:
+        return
+
+    resources: List[Dict[str, Any]] = []
+    for resource, give_cmd, pairs, balance_field in (
+        ("kakera", "$givek", _normalize_give_pairs(getattr(Vars, 'Kakera_Give', [])), "total_balance"),
+        ("sphere", "$givesp", _normalize_give_pairs(getattr(Vars, 'Sphere_Give', [])), "sphere_balance"),
+    ):
+        target_id = _resolve_give_target_id(pairs, source_id)
+        if target_id is None:
+            continue
+        bucket = _auto_give_hour_bucket(now_ts)
+        key = _auto_give_entry_key(source_id, resource, bucket)
+        resources.append(
+            {
+                "key": key,
+                "bucket": bucket,
+                "resource": resource,
+                "give_cmd": give_cmd,
+                "target_id": target_id,
+                "balance_field": balance_field,
+            }
+        )
+    if not resources:
+        return
+    if all(_is_auto_give_seen(cast(str, spec["key"])) for spec in resources):
+        return
+
+    scope = build_path_scope("auto-give-state", AUTO_GIVE_STATE_FILE)
+    with acquire_lease(
+        scope,
+        f"auto-give@pid{os.getpid()}",
+        ttl_sec=30.0,
+        heartbeat_sec=5.0,
+        wait_timeout_sec=0.0,
+    ) as ledger_lease:
+        if not ledger_lease.acquired:
+            return
+
+        payload = _load_auto_give_state()
+        entries = payload.setdefault("entries", {})
+        if not isinstance(entries, dict):
+            entries = {}
+            payload["entries"] = entries
+
+        cached_status = _get_cached_tu_info(token)
+        pending: List[Dict[str, Any]] = []
+        dirty = False
+
+        for spec in resources:
+            key = cast(str, spec["key"])
+            existing = entries.get(key)
+            if isinstance(existing, dict):
+                _mark_auto_give_seen(key)
+                continue
+
+            target_id = cast(int, spec["target_id"])
+            if target_id == source_id:
+                entries[key] = _build_auto_give_entry(
+                    bucket=cast(str, spec["bucket"]),
+                    source_id=source_id,
+                    resource=cast(str, spec["resource"]),
+                    status="no_target",
+                    amount=0,
+                    target_id=target_id,
+                    now_ts=now_ts,
+                    note="source_equals_target",
+                )
+                _mark_auto_give_seen(key)
+                dirty = True
+                continue
+
+            if not cached_status:
+                entries[key] = _build_auto_give_entry(
+                    bucket=cast(str, spec["bucket"]),
+                    source_id=source_id,
+                    resource=cast(str, spec["resource"]),
+                    status="no_state",
+                    amount=0,
+                    target_id=target_id,
+                    now_ts=now_ts,
+                )
+                _mark_auto_give_seen(key)
+                dirty = True
+                continue
+
+            amount = _to_int_or_none(cached_status.get(cast(str, spec["balance_field"]))) or 0
+            if amount <= 0:
+                entries[key] = _build_auto_give_entry(
+                    bucket=cast(str, spec["bucket"]),
+                    source_id=source_id,
+                    resource=cast(str, spec["resource"]),
+                    status="no_balance",
+                    amount=amount,
+                    target_id=target_id,
+                    now_ts=now_ts,
+                )
+                _mark_auto_give_seen(key)
+                dirty = True
+                continue
+
+            entries[key] = _build_auto_give_entry(
+                bucket=cast(str, spec["bucket"]),
+                source_id=source_id,
+                resource=cast(str, spec["resource"]),
+                status="attempting",
+                amount=amount,
+                target_id=target_id,
+                now_ts=now_ts,
+            )
+            spec["amount"] = amount
+            pending.append(spec)
+            _mark_auto_give_seen(key)
+            dirty = True
+
+        if dirty:
+            _save_auto_give_state(payload)
+        if not pending:
+            return
+
+        resolved_id, resolved_name = _ensure_user_identity(token)
+        gate_lease, gate_allowed = _acquire_same_account_action_gate(
+            token,
+            resolved_id,
+            resolved_name,
+            wait_timeout_sec=0.0,
+        )
+        if not gate_allowed:
+            for spec in pending:
+                entries[cast(str, spec["key"])] = _build_auto_give_entry(
+                    bucket=cast(str, spec["bucket"]),
+                    source_id=source_id,
+                    resource=cast(str, spec["resource"]),
+                    status="busy_skip",
+                    amount=int(spec.get("amount", 0) or 0),
+                    target_id=cast(int, spec["target_id"]),
+                    now_ts=now_ts,
+                )
+            _save_auto_give_state(payload)
+            log_info("[AUTO-GIVE] Skipping scheduled transfers because the same-account action gate is busy")
+            return
+
+        try:
+            _bot, auth = getClientAndAuth(token)
+            url = getUrl()
+        except Exception as exc:
+            for spec in pending:
+                entries[cast(str, spec["key"])] = _build_auto_give_entry(
+                    bucket=cast(str, spec["bucket"]),
+                    source_id=source_id,
+                    resource=cast(str, spec["resource"]),
+                    status="network_fail",
+                    amount=int(spec.get("amount", 0) or 0),
+                    target_id=cast(int, spec["target_id"]),
+                    now_ts=now_ts,
+                    note=str(exc),
+                )
+            _save_auto_give_state(payload)
+            log(f"[AUTO-GIVE] Failed to initialize scheduled transfers: {exc}")
+            return
+
+        try:
+            for spec in pending:
+                key = cast(str, spec["key"])
+                resource = cast(str, spec["resource"])
+                give_cmd = cast(str, spec["give_cmd"])
+                target_id = cast(int, spec["target_id"])
+                amount = int(spec.get("amount", 0) or 0)
+                target_mention, target_label, mention_mode = _get_target_mention_for_config_id(target_id)
+                if not target_mention:
+                    entries[key] = _build_auto_give_entry(
+                        bucket=cast(str, spec["bucket"]),
+                        source_id=source_id,
+                        resource=resource,
+                        status="no_target",
+                        amount=amount,
+                        target_id=target_id,
+                        now_ts=now_ts,
+                        note="unresolved_target",
+                    )
+                    _save_auto_give_state(payload)
+                    log(f"[AUTO-GIVE] Skipped {give_cmd}: target id {target_id} has no resolvable mention/username.")
+                    continue
+                if mention_mode != "id":
+                    log(
+                        f"[AUTO-GIVE] Warning: using @{target_label} text fallback (no discord user id resolved). "
+                        "Use tokens[].discord_user_id (or valid token prefix) for stable mention."
+                    )
+
+                command = f"{give_cmd} {target_mention} {amount}"
+                ok = _send_text_command(
+                    url=url,
+                    auth=auth,
+                    content=command,
+                    raw_label=f"POST - {give_cmd} scheduled auto-give command",
+                )
+                if not ok:
+                    entries[key] = _build_auto_give_entry(
+                        bucket=cast(str, spec["bucket"]),
+                        source_id=source_id,
+                        resource=resource,
+                        status="command_fail",
+                        amount=amount,
+                        target_id=target_id,
+                        now_ts=now_ts,
+                    )
+                    _save_auto_give_state(payload)
+                    log(f"[AUTO-GIVE] Command failed: {command}")
+                    continue
+                log(f"[AUTO-GIVE] Sent: {command}")
+
+                if _sleep_interruptible(2.0):
+                    entries[key] = _build_auto_give_entry(
+                        bucket=cast(str, spec["bucket"]),
+                        source_id=source_id,
+                        resource=resource,
+                        status="interrupted",
+                        amount=amount,
+                        target_id=target_id,
+                        now_ts=now_ts,
+                    )
+                    _save_auto_give_state(payload)
+                    return
+
+                ok_confirm = _send_text_command(
+                    url=url,
+                    auth=auth,
+                    content='y',
+                    raw_label=f"POST - {give_cmd} scheduled auto-give confirm",
+                )
+                if ok_confirm:
+                    entries[key] = _build_auto_give_entry(
+                        bucket=cast(str, spec["bucket"]),
+                        source_id=source_id,
+                        resource=resource,
+                        status="confirmed",
+                        amount=amount,
+                        target_id=target_id,
+                        now_ts=now_ts,
+                    )
+                    _save_auto_give_state(payload)
+                    log(f"[AUTO-GIVE] Confirmed {give_cmd} transfer with 'y'.")
+                    if resource == "kakera":
+                        cached_status = _apply_cached_tu_updates(token, cached_status, total_balance=0) or cached_status
+                    else:
+                        cached_status = _apply_cached_tu_updates(token, cached_status, sphere_balance=0) or cached_status
+                    continue
+
+                entries[key] = _build_auto_give_entry(
+                    bucket=cast(str, spec["bucket"]),
+                    source_id=source_id,
+                    resource=resource,
+                    status="confirm_fail",
+                    amount=amount,
+                    target_id=target_id,
+                    now_ts=now_ts,
+                )
+                _save_auto_give_state(payload)
+                log(f"[AUTO-GIVE] Confirm failed for {give_cmd} transfer.")
+        finally:
+            if gate_lease is not None:
+                gate_lease.release()
+
+
 def _run_auto_give_from_tu(
     *,
     token: str,
@@ -1645,68 +2040,8 @@ def _run_auto_give_from_tu(
     url: str,
     auth: Dict[str, str],
 ) -> None:
-    source_id = _get_token_config_id(token)
-    if source_id is None:
-        return
-
-    kakera_pairs = _normalize_give_pairs(getattr(Vars, 'Kakera_Give', []))
-    sphere_pairs = _normalize_give_pairs(getattr(Vars, 'Sphere_Give', []))
-    kakera_balance = _to_int_or_none(status.get('total_balance')) or 0
-    sphere_balance = _to_int_or_none(status.get('sphere_balance')) or 0
-
-    def _dispatch(
-        pairs: List[Tuple[int, int]],
-        amount: int,
-        give_cmd: str,
-    ) -> None:
-        if amount <= 0:
-            return
-        target_id: Optional[int] = None
-        for src, dst in pairs:
-            if src == source_id:
-                target_id = dst
-                break
-        if target_id is None:
-            return
-        if target_id == source_id:
-            log(f"[AUTO-GIVE] Skipped {give_cmd}: source id equals target id ({source_id}).")
-            return
-        target_mention, target_label, mention_mode = _get_target_mention_for_config_id(target_id)
-        if not target_mention:
-            log(f"[AUTO-GIVE] Skipped {give_cmd}: target id {target_id} has no resolvable mention/username.")
-            return
-        if mention_mode != "id":
-            log(
-                f"[AUTO-GIVE] Warning: using @{target_label} text fallback (no discord user id resolved). "
-                "Use tokens[].discord_user_id (or valid token prefix) for stable mention."
-            )
-
-        command = f"{give_cmd} {target_mention} {amount}"
-        ok = _send_text_command(
-            url=url,
-            auth=auth,
-            content=command,
-            raw_label=f"POST - {give_cmd} auto-give command",
-        )
-        if not ok:
-            log(f"[AUTO-GIVE] Command failed: {command}")
-            return
-        log(f"[AUTO-GIVE] Sent: {command}")
-        if _sleep_interruptible(2.0):
-            return
-        ok_confirm = _send_text_command(
-            url=url,
-            auth=auth,
-            content='y',
-            raw_label=f"POST - {give_cmd} auto-give confirm",
-        )
-        if ok_confirm:
-            log(f"[AUTO-GIVE] Confirmed {give_cmd} transfer with 'y'.")
-        else:
-            log(f"[AUTO-GIVE] Confirm failed for {give_cmd} transfer.")
-
-    _dispatch(kakera_pairs, kakera_balance, "$givek")
-    _dispatch(sphere_pairs, sphere_balance, "$givesp")
+    # Compatibility shim: transfers are scheduled by time bucket, not by /tu refresh frequency.
+    maybe_run_scheduled_transfers(token)
 
 def scanForManualClaims(token: str, target_username: str, include_persistent: bool = False) -> List[Dict[str, Any]]:
     """
@@ -3656,7 +3991,6 @@ def getTuInfo(token: str) -> Optional[Dict[str, Any]]:
             render_dashboard()
             _cache_tu_info(token, status)
             _set_last_fetch_reason("tu", token, "sent")
-            _run_auto_give_from_tu(token=token, status=status, url=url, auth=auth)
             return status
         finally:
             if lease is not None:
@@ -4137,9 +4471,7 @@ def _try_external_kakera_react(
                     continue
                 if _sleep_interruptible(Vars.SLEEP_MED_SEC):
                     return tu_info
-                tu_info['current_power'] = getMaxPowerForToken(token)
-                tu_info['dk_ready'] = False
-                _cache_tu_info(token, tu_info)
+                tu_info = _synthesize_tu_after_dk(token, tu_info) or tu_info
             else:
                 log(f"[STEAL-REACT] Skipped: power {tu_info.get('current_power', 0)}% < {tu_info.get('kakera_cost', 40)}% and /dk not ready")
                 continue
@@ -4320,9 +4652,7 @@ def _scan_external_rolls(
                         continue
                     if _sleep_interruptible(Vars.SLEEP_MED_SEC):
                         return tu_info
-                    tu_info['can_claim_now'] = True
-                    tu_info['rt_available'] = False
-                    _cache_tu_info(token, tu_info)
+                    tu_info = _synthesize_tu_after_rt(token, tu_info) or tu_info
                 else:
                     log("[STEAL-CLAIM] Skipped: claim cooldown and /rt not ready")
                     continue
@@ -4830,14 +5160,16 @@ def _run_enhanced_roll_session(
     tu_info: Dict[str, Any],
     mudae_star_wishes: List[str],
     mudae_regular_wishes: List[str],
+    skip_pre_roll_revalidation: bool = False,
 ) -> Optional[Dict[str, Any]]:
-    refreshed_tu, refreshed_ok = _refresh_roll_status(token, "pre-roll verification")
-    if refreshed_ok and refreshed_tu:
-        tu_info = refreshed_tu
-    else:
-        log_warn("Skipping roll session because /tu could not be revalidated before rolling")
-        render_dashboard()
-        return tu_info
+    if not skip_pre_roll_revalidation:
+        refreshed_tu, refreshed_ok = _refresh_roll_status(token, "pre-roll verification")
+        if refreshed_ok and refreshed_tu:
+            tu_info = refreshed_tu
+        else:
+            log_warn("Skipping roll session because /tu could not be revalidated before rolling")
+            render_dashboard()
+            return tu_info
 
     if tu_info.get("maintenance", False):
         maintenance_min = tu_info["next_reset_min"]
@@ -5141,7 +5473,7 @@ def _run_enhanced_roll_session(
                         useSpecialCommand(token, "dk")
                         if Latency.get_active_tier() == "legacy" and _sleep_interruptible(Vars.SLEEP_LONG_SEC):
                             return None
-                        tu_info = getTuInfo(token)
+                        tu_info = _synthesize_tu_after_dk(token, tu_info) or tu_info
                         log(f"   ⚡ Power refreshed to {tu_info.get('current_power', 0)}%")
                     else:
                         log(
@@ -5282,7 +5614,7 @@ def _run_enhanced_roll_session(
                     useSpecialCommand(token, "rollsutil resetclaimtimer")
                     if Latency.get_active_tier() == "legacy" and _sleep_interruptible(Vars.SLEEP_LONG_SEC):
                         return None
-                    tu_info = getTuInfo(token)
+                    tu_info = _synthesize_tu_after_rt(token, tu_info) or tu_info
                 else:
                     best_candidate_state["status"] = "CAN'T CLAIM (cooldown + $rt not ready)"
                     _dashboard_set_best_candidate(best_candidate_state)
@@ -5428,6 +5760,7 @@ def enhancedRoll(token: str, initial_tu_info: Optional[Dict[str, Any]] = None) -
         return None
 
     cached_tu = initial_tu_info if initial_tu_info is not None else initial_tu_cache.pop(token, None)
+    fetched_fresh_tu = False
     coordination_enabled = bool(getattr(Vars, "ROLL_COORDINATION_ENABLED", True))
     lease = None
     try:
@@ -5466,6 +5799,7 @@ def enhancedRoll(token: str, initial_tu_info: Optional[Dict[str, Any]] = None) -
             _cache_tu_info(token, tu_info)
         else:
             tu_info = getTuInfo(token)
+            fetched_fresh_tu = tu_info is not None
         if not tu_info:
             log("❌ Failed to get /tu info")
             render_dashboard()
@@ -5495,6 +5829,7 @@ def enhancedRoll(token: str, initial_tu_info: Optional[Dict[str, Any]] = None) -
             tu_info=tu_info,
             mudae_star_wishes=mudae_star_wishes,
             mudae_regular_wishes=mudae_regular_wishes,
+            skip_pre_roll_revalidation=fetched_fresh_tu,
         )
     finally:
         if lease is not None:

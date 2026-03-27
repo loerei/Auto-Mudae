@@ -13,6 +13,7 @@ from mudae.core.session_engine import (
     initializeSession,
     enhancedRoll,
     getLastTuFetchReason,
+    maybe_run_scheduled_transfers,
     log,
     log_info,
     log_success,
@@ -276,6 +277,8 @@ def main():
         scan_inflight = False
         conn_check_interval = 5.0
         last_conn_check = 0.0
+        transfer_check_interval = 5.0
+        last_transfer_check = 0.0
         scan_lock = threading.Lock()
         scan_bounds = _scan_interval_bounds(int(seconds))
         end_time = time.monotonic() + max(0, seconds)
@@ -331,6 +334,12 @@ def main():
                 if (not scan_inflight) and (now - last_scan >= scan_interval_sec):
                     scan_inflight = True
                     threading.Thread(target=_scan_worker, daemon=True).start()
+                if now - last_transfer_check >= transfer_check_interval:
+                    last_transfer_check = now
+                    try:
+                        maybe_run_scheduled_transfers(token)
+                    except Exception:
+                        pass
                 if now - last_conn_check >= conn_check_interval:
                     last_conn_check = now
                     check = probe_token_status(token)
