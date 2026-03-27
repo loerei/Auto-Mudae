@@ -376,6 +376,87 @@ textarea {
   margin-bottom: 0.85rem;
 }
 
+.settings-section {
+  scroll-margin-top: 1rem;
+}
+
+.settings-warning {
+  padding: 0.85rem 1rem;
+  border-radius: var(--radius-sm);
+  border: 1px solid var(--border-soft);
+  background: var(--warning-soft);
+  color: var(--text-primary);
+}
+
+.settings-field-card {
+  display: grid;
+  gap: 0.75rem;
+}
+
+.settings-field-card.danger-zone {
+  border-color: color-mix(in srgb, var(--danger-plain) 38%, var(--border-soft));
+}
+
+.settings-field-header {
+  display: flex;
+  align-items: start;
+  justify-content: space-between;
+  gap: 0.75rem;
+  flex-wrap: wrap;
+}
+
+.settings-field-header h4 {
+  margin: 0;
+}
+
+.settings-inline-input,
+.settings-kv-row,
+.settings-pair-row,
+.settings-chip-row {
+  display: flex;
+  gap: 0.6rem;
+  align-items: center;
+  flex-wrap: wrap;
+}
+
+.settings-chip-list,
+.settings-kv-table,
+.settings-pair-list,
+.settings-list-editor {
+  display: grid;
+  gap: 0.65rem;
+}
+
+.settings-chip {
+  display: inline-flex;
+  align-items: center;
+  padding: 0.35rem 0.7rem;
+  border-radius: 999px;
+  background: var(--accent-soft);
+  border: 1px solid var(--border-soft);
+}
+
+.settings-kv-row > span {
+  min-width: 120px;
+  font-weight: 600;
+  color: var(--text-secondary);
+}
+
+.settings-pair-row .field {
+  flex: 1 1 0;
+}
+
+.field-error {
+  margin: 0;
+  color: var(--danger-plain);
+  font-size: 0.9rem;
+  font-weight: 600;
+}
+
+.unknown-setting-card pre {
+  margin: 0;
+}
+
 .empty-state {
   text-align: center;
   padding: 2rem 1.5rem;
@@ -390,6 +471,19 @@ textarea {
 @media (max-width: 1100px) {
   .data-table {
     min-width: 100%;
+  }
+}
+
+@media (max-width: 960px) {
+  .settings-kv-row,
+  .settings-pair-row,
+  .settings-chip-row,
+  .settings-inline-input {
+    align-items: stretch;
+  }
+
+  .settings-kv-row > span {
+    min-width: 0;
   }
 }
 

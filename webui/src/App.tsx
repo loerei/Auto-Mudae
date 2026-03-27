@@ -1,28 +1,28 @@
-import { ChangeEvent, FormEvent, ReactNode, useEffect, useMemo, useRef, useState } from "react";
+import { FormEvent, ReactNode, useEffect, useMemo, useRef, useState } from "react";
 
 import { AnimatePresence, MotionConfig, motion, useReducedMotion } from "framer-motion";
 
 import { DashboardPanel, LiveDashboard, LogPayloadView, OverviewCard, StatusChip, fmtTime } from "./live-ui";
 import { buildFadeUp, buildHighlightFlash, buildStaggerContainer, getTabTransition } from "./motion";
-import { DEFAULT_UI_SETTINGS, mergeUiSettings, nextThemeMode, normalizeUiSettings, useResolvedTheme } from "./theme";
+import { normalizeUiSettings, useResolvedTheme } from "./theme";
+import { SettingsWorkspace, THEME_LABELS } from "./settings-ui";
 import {
   Account,
   AccountHistory,
   AccountSnapshot,
   EventItem,
+  FieldError,
   LiveEventMessage,
   OverviewPayload,
   SessionItem,
+  SettingsSchema,
   SettingsPayload,
-  ThemeMode,
-  UISettings,
   WishlistItem,
   WishlistPayload
 } from "./types";
 
 const TABS = ["Overview", "Accounts", "Wishlist", "Logs", "Settings"] as const;
 const ACCOUNT_SUBTABS = ["Live", "Main Bot", "Ouro", "History", "Config"] as const;
-const THEME_LABELS: Record<ThemeMode, string> = { system: "System", light: "Light", dark: "Dark" };
 
 async function fetchJson<T>(url: string, init?: RequestInit): Promise<T> {
   const response = await fetch(url, {
@@ -30,10 +30,24 @@ async function fetchJson<T>(url: string, init?: RequestInit): Promise<T> {
     ...init
   });
   if (!response.ok) {
-    const text = await response.text();
-    throw new Error(text || `Request failed: ${response.status}`);
+    throw new Error(await readErrorMessage(response));
   }
   return (await response.json()) as T;
+}
+
+async function readErrorMessage(response: Response): Promise<string> {
+  const text = await response.text();
+  if (!text) {
+    return `Request failed: ${response.status}`;
+  }
+  try {
+    const payload = JSON.parse(text) as { detail?: unknown; message?: unknown };
+    if (typeof payload.detail === "string" && payload.detail.trim()) return payload.detail;
+    if (typeof payload.message === "string" && payload.message.trim()) return payload.message;
+  } catch {
+    // Fall back to the raw text for non-JSON responses.
+  }
+  return text;
 }
 
 function toLocalInputValue(date: Date): string {
@@ -43,14 +57,6 @@ function toLocalInputValue(date: Date): string {
   const hours = `${date.getHours()}`.padStart(2, "0");
   const minutes = `${date.getMinutes()}`.padStart(2, "0");
   return `${year}-${month}-${day}T${hours}:${minutes}`;
-}
-
-function parseJsonEditor(text: string): Record<string, unknown> {
-  const parsed = JSON.parse(text);
-  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
-    throw new Error("Expected a JSON object.");
-  }
-  return parsed as Record<string, unknown>;
 }
 
 function emptyWishlistRow(): WishlistItem {
@@ -113,21 +119,6 @@ function PageHeader(props: {
   );
 }
 
-function ThemeModeControl(props: {
-  value: ThemeMode;
-  onChange: (mode: ThemeMode) => void;
-}) {
-  return (
-    <div className="segmented-control" role="tablist" aria-label="Theme mode">
-      {(Object.keys(THEME_LABELS) as ThemeMode[]).map((mode) => (
-        <button key={mode} type="button" className={props.value === mode ? "active" : ""} onClick={() => props.onChange(mode)}>
-          {THEME_LABELS[mode]}
-        </button>
-      ))}
-    </div>
-  );
-}
-
 function WishlistEditor(props: {
   title: string;
   items: WishlistItem[];
@@ -181,6 +172,8 @@ export default function App() {
   const [overview, setOverview] = useState<OverviewPayload | null>(null);
   const [logs, setLogs] = useState<EventItem[]>([]);
   const [settings, setSettings] = useState<SettingsPayload | null>(null);
+  const [settingsSchema, setSettingsSchema] = useState<SettingsSchema | null>(null);
+  const [settingsSchemaError, setSettingsSchemaError] = useState<string | null>(null);
   const [wishlist, setWishlist] = useState<WishlistPayload | null>(null);
   const [history, setHistory] = useState<AccountHistory | null>(null);
   const [selectedAccountId, setSelectedAccountId] = useState<number | null>(null);
@@ -189,14 +182,10 @@ export default function App() {
   const [logLevel, setLogLevel] = useState<string>("");
   const [globalWishlistDraft, setGlobalWishlistDraft] = useState<WishlistItem[]>([]);
   const [accountWishlistDraft, setAccountWishlistDraft] = useState<WishlistItem[]>([]);
-  const [appSettingsText, setAppSettingsText] = useState<string>("{}");
-  const [uiSettingsText, setUiSettingsText] = useState<string>("{}");
-  const [uiDraft, setUiDraft] = useState<UISettings>(DEFAULT_UI_SETTINGS);
   const [accountForm, setAccountForm] = useState<Account>({ id: 0, name: "", discord_user_id: "", discordusername: "", token: "", max_power: 110 });
   const [queueMode, setQueueMode] = useState<string>("main");
   const [scheduleMode, setScheduleMode] = useState<string>("main");
   const [scheduleAt, setScheduleAt] = useState<string>(toLocalInputValue(new Date(Date.now() + 10 * 60 * 1000)));
-  const [importText, setImportText] = useState<string>("");
   const [pendingLogCount, setPendingLogCount] = useState(0);
 
   const logListRef = useRef<HTMLDivElement | null>(null);
@@ -212,7 +201,7 @@ export default function App() {
     return wishlist.accounts[String(selectedAccountId)] ?? [];
   }, [selectedAccountId, wishlist]);
   const savedUiSettings = useMemo(() => normalizeUiSettings(settings?.ui_settings), [settings]);
-  const themeMode = uiDraft.theme ?? DEFAULT_UI_SETTINGS.theme;
+  const themeMode = savedUiSettings.theme;
   const resolvedTheme = useResolvedTheme(themeMode);
   const totalAccounts = overview?.accounts.length ?? 0;
   const queuedCount = overview?.queue.length ?? 0;
@@ -220,7 +209,6 @@ export default function App() {
     () => (wishlist?.global.length ?? 0) + Object.values(wishlist?.accounts ?? {}).reduce((sum, items) => sum + items.length, 0),
     [wishlist]
   );
-  const isUiDraftDirty = useMemo(() => JSON.stringify(savedUiSettings) !== JSON.stringify(uiDraft), [savedUiSettings, uiDraft]);
   const tabVariants = getTabTransition(reducedMotion);
   const overviewVariants = buildStaggerContainer(reducedMotion, 0.05);
   const logListVariants = buildStaggerContainer(reducedMotion, 0.03);
@@ -257,9 +245,25 @@ export default function App() {
   async function loadSettings() {
     const payload = await fetchJson<SettingsPayload>("/api/settings");
     setSettings(payload);
-    setAppSettingsText(JSON.stringify(payload.app_settings, null, 2));
-    setUiSettingsText(JSON.stringify(payload.ui_settings, null, 2));
-    setUiDraft(normalizeUiSettings(payload.ui_settings));
+  }
+
+  async function loadSettingsSchema() {
+    const response = await fetch("/api/settings/schema", {
+      headers: { "Content-Type": "application/json" }
+    });
+    if (!response.ok) {
+      const baseMessage = await readErrorMessage(response);
+      const message =
+        response.status === 404
+          ? "This daemon is missing /api/settings/schema. Restart run_webui.bat so the backend matches the redesigned Settings page."
+          : baseMessage;
+      setSettingsSchema(null);
+      setSettingsSchemaError(message);
+      throw new Error(message);
+    }
+    const payload = (await response.json()) as SettingsSchema;
+    setSettingsSchema(payload);
+    setSettingsSchemaError(null);
   }
 
   async function loadWishlist() {
@@ -277,23 +281,37 @@ export default function App() {
   }
 
   async function refreshAll(showNotice = true) {
-    await Promise.all([loadOverview(), loadSettings(), loadWishlist(), loadLogs()]);
+    await Promise.all([loadOverview(), loadSettings(), loadSettingsSchema(), loadWishlist(), loadLogs()]);
     if (selectedAccountId != null) await loadHistory(selectedAccountId);
     if (showNotice) {
       setNotice(`Refreshed at ${new Date().toLocaleTimeString()}.`);
     }
   }
 
-  async function persistSettings(nextAppSettings: Record<string, unknown>, nextUiSettings: Record<string, unknown>, noticeMessage: string) {
-    const saved = await fetchJson<SettingsPayload>("/api/settings", {
-      method: "PUT",
-      body: JSON.stringify({ app_settings: nextAppSettings, ui_settings: nextUiSettings })
+  async function patchSettings(patch: Partial<SettingsPayload>) {
+    const response = await fetch("/api/settings", {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(patch)
     });
+    if (!response.ok) {
+      let payload: { message?: string; field_errors?: FieldError[] } | null = null;
+      try {
+        payload = (await response.json()) as { message?: string; field_errors?: FieldError[] };
+      } catch {
+        payload = null;
+      }
+      const fallbackMessage =
+        response.status === 404 || response.status === 405
+          ? "This daemon is older than the current WebUI build. Restart run_webui.bat so Settings PATCH support is available."
+          : `Request failed: ${response.status}`;
+      const error = new Error(payload?.message || fallbackMessage) as Error & { fieldErrors?: FieldError[] };
+      error.fieldErrors = payload?.field_errors ?? [];
+      throw error;
+    }
+    const saved = (await response.json()) as SettingsPayload;
     setSettings(saved);
-    setAppSettingsText(JSON.stringify(saved.app_settings, null, 2));
-    setUiSettingsText(JSON.stringify(saved.ui_settings, null, 2));
-    setUiDraft(normalizeUiSettings(saved.ui_settings));
-    setNotice(noticeMessage);
+    await loadSettingsSchema();
     return saved;
   }
 
@@ -318,26 +336,11 @@ export default function App() {
     await loadOverview();
   }
 
-  async function saveUiSettings() {
-    await persistSettings(settings?.app_settings ?? {}, mergeUiSettings(settings?.ui_settings, uiDraft), "WebUI settings saved.");
-  }
-
-  async function saveAdvancedSettings() {
-    const nextAppSettings = parseJsonEditor(appSettingsText);
-    const nextUiSettings = mergeUiSettings(parseJsonEditor(uiSettingsText));
-    await persistSettings(nextAppSettings, nextUiSettings, "Advanced settings saved.");
-  }
-
   async function quickToggleTheme() {
-    const previousDraft = uiDraft;
-    const nextDraft = { ...uiDraft, theme: nextThemeMode(uiDraft.theme) };
-    setUiDraft(nextDraft);
-    try {
-      await persistSettings(settings?.app_settings ?? {}, mergeUiSettings(settings?.ui_settings, nextDraft), `Theme set to ${THEME_LABELS[nextDraft.theme]}.`);
-    } catch (error) {
-      setUiDraft(previousDraft);
-      throw error;
-    }
+    const order: typeof themeMode[] = ["system", "light", "dark"];
+    const nextTheme = order[(order.indexOf(themeMode) + 1 + order.length) % order.length];
+    await patchSettings({ ui_settings: { theme: nextTheme } });
+    setNotice(`Theme set to ${THEME_LABELS[nextTheme]}.`);
   }
 
   async function saveGlobalWishlist() {
@@ -392,17 +395,11 @@ export default function App() {
     URL.revokeObjectURL(url);
   }
 
-  async function importData() {
-    const payload = JSON.parse(importText);
+  async function importData(text: string) {
+    const payload = JSON.parse(text);
     await fetchJson("/api/import", { method: "POST", body: JSON.stringify(payload) });
     setNotice("Imported backup bundle.");
     await refreshAll(false);
-  }
-
-  function handleImportFile(event: ChangeEvent<HTMLInputElement>) {
-    const file = event.target.files?.[0];
-    if (!file) return;
-    void file.text().then((text) => setImportText(text));
   }
 
   function flushPendingLogs(scrollToTop = true) {
@@ -429,13 +426,6 @@ export default function App() {
       .then(() => setNotice("Connected to local daemon."))
       .catch((error: Error) => setNotice(error.message));
   }, []);
-
-  useEffect(() => {
-    if (!settings) return;
-    setAppSettingsText(JSON.stringify(settings.app_settings, null, 2));
-    setUiSettingsText(JSON.stringify(settings.ui_settings, null, 2));
-    setUiDraft(normalizeUiSettings(settings.ui_settings));
-  }, [settings]);
 
   useEffect(() => {
     if (!selectedSnapshot) return;
@@ -897,92 +887,25 @@ export default function App() {
               <PageHeader
                 eyebrow="Preferences"
                 title="Settings"
-                description="Appearance and WebUI runtime options are structured here. Raw JSON stays available in Advanced editors."
+                description="Structured settings are grouped by category, with advanced integration fields isolated from routine runtime controls."
                 meta={
                   <div className="badge-row">
-                    <StatusChip tone="neutral">Theme: {THEME_LABELS[uiDraft.theme]}</StatusChip>
+                    <StatusChip tone="neutral">Theme: {THEME_LABELS[themeMode]}</StatusChip>
                     <StatusChip tone="neutral">Resolved: {resolvedTheme}</StatusChip>
-                    <StatusChip tone={isUiDraftDirty ? "warning" : "success"}>{isUiDraftDirty ? "Unsaved UI changes" : "UI settings saved"}</StatusChip>
+                    <StatusChip tone="neutral">Schema-driven</StatusChip>
                   </div>
                 }
               />
-              <section className="grid two-col settings-grid">
-                <DashboardPanel title="Appearance" subtitle="Default theme mode is System, but users can override it from the header or here.">
-                  <div className="settings-stack">
-                    <ThemeModeControl value={uiDraft.theme} onChange={(mode) => setUiDraft((prev) => ({ ...prev, theme: mode }))} />
-                    <p className="muted">Current resolved theme: <strong>{resolvedTheme}</strong></p>
-                    <p className="muted">The header quick toggle cycles through System, Light, and Dark while saving immediately.</p>
-                  </div>
-                </DashboardPanel>
-                <DashboardPanel title="WebUI Runtime" subtitle="These values affect localhost binding, retention, and launch behavior.">
-                  <div className="field-grid">
-                    <label className="field">
-                      <span>Bind host</span>
-                      <input value={uiDraft.bind_host} onChange={(event) => setUiDraft((prev) => ({ ...prev, bind_host: event.target.value }))} />
-                    </label>
-                    <label className="field">
-                      <span>Bind port</span>
-                      <input type="number" min={1} value={uiDraft.bind_port} onChange={(event) => setUiDraft((prev) => ({ ...prev, bind_port: Number(event.target.value) || DEFAULT_UI_SETTINGS.bind_port }))} />
-                    </label>
-                    <label className="field">
-                      <span>Retention days</span>
-                      <input type="number" min={1} value={uiDraft.retention_days} onChange={(event) => setUiDraft((prev) => ({ ...prev, retention_days: Number(event.target.value) || DEFAULT_UI_SETTINGS.retention_days }))} />
-                    </label>
-                    <div className="field toggle-field">
-                      <span>Auto open browser</span>
-                      <label className="checkbox">
-                        <input type="checkbox" checked={uiDraft.auto_open_browser} onChange={(event) => setUiDraft((prev) => ({ ...prev, auto_open_browser: event.target.checked }))} />
-                        <span>Open localhost automatically on launch</span>
-                      </label>
-                    </div>
-                  </div>
-                  <div className="button-row">
-                    <button className="primary" type="button" onClick={() => void saveUiSettings().catch((error: Error) => setNotice(error.message))}>
-                      Save WebUI Settings
-                    </button>
-                    <button type="button" disabled={!isUiDraftDirty} onClick={() => setUiDraft(savedUiSettings)}>
-                      Reset
-                    </button>
-                  </div>
-                </DashboardPanel>
-                <DashboardPanel title="Backup and Restore" subtitle="Export a full local backup or import one after stopping live sessions.">
-                  <div className="settings-stack">
-                    <div className="button-row">
-                      <button className="primary" type="button" onClick={() => void exportData().catch((error: Error) => setNotice(error.message))}>
-                        Export Backup
-                      </button>
-                    </div>
-                    <input type="file" accept="application/json" onChange={handleImportFile} />
-                    <textarea className="code-block" value={importText} onChange={(event) => setImportText(event.target.value)} placeholder="Paste exported JSON here" />
-                    <div className="button-row">
-                      <button className="primary" type="button" onClick={() => void importData().catch((error: Error) => setNotice(error.message))}>
-                        Import Backup
-                      </button>
-                    </div>
-                  </div>
-                </DashboardPanel>
-                <section className="panel">
-                  <div className="panel-header">
-                    <div>
-                      <h3>Advanced Editors</h3>
-                      <p className="muted">Use raw JSON only for power-user adjustments not covered by the structured controls above.</p>
-                    </div>
-                  </div>
-                  <details className="advanced-panel">
-                    <summary>App Settings JSON</summary>
-                    <textarea className="code-block" value={appSettingsText} onChange={(event) => setAppSettingsText(event.target.value)} />
-                  </details>
-                  <details className="advanced-panel">
-                    <summary>UI Settings JSON</summary>
-                    <textarea className="code-block" value={uiSettingsText} onChange={(event) => setUiSettingsText(event.target.value)} />
-                  </details>
-                  <div className="button-row">
-                    <button className="primary" type="button" onClick={() => void saveAdvancedSettings().catch((error: Error) => setNotice(error.message))}>
-                      Save Advanced JSON
-                    </button>
-                  </div>
-                </section>
-              </section>
+              <SettingsWorkspace
+                settings={settings}
+                schema={settingsSchema}
+                schemaError={settingsSchemaError}
+                resolvedTheme={resolvedTheme}
+                onPatch={patchSettings}
+                onExport={exportData}
+                onImport={importData}
+                onNotice={setNotice}
+              />
             </motion.section>
           )}
         </AnimatePresence>

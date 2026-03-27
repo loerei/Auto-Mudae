@@ -94,3 +94,62 @@ def test_webui_put_settings_normalizes_theme_defaults(tmp_path, monkeypatch) -> 
     assert payload["app_settings"]["MACHINE_TAG"] == "theme-test"
     assert payload["ui_settings"]["theme"] == "light"
     assert payload["ui_settings"]["retention_days"] == 1
+
+
+def test_webui_get_settings_schema_lists_sections_and_unknown_keys(tmp_path, monkeypatch) -> None:
+    temp_db = WebDB(tmp_path / "webui.db")
+    temp_supervisor = WebSupervisor(temp_db)
+    temp_db.set_settings("app_settings", {"rollCommand": "wx", "UNKNOWN_FLAG": "mystery"})
+
+    monkeypatch.setattr(WebServer, "db", temp_db)
+    monkeypatch.setattr(WebServer, "supervisor", temp_supervisor)
+    monkeypatch.setattr(WebServer, "build_initial_import_bundle", lambda: {"accounts": [], "wishlists": {"global": [], "accounts": {}}})
+
+    with TestClient(WebServer.app) as client:
+        response = client.get("/api/settings/schema")
+
+    payload = response.json()
+
+    assert response.status_code == 200
+    assert any(section["id"] == "appearance" for section in payload["sections"])
+    assert any(item["key"] == "UNKNOWN_FLAG" for item in payload["unknown_app_settings"])
+
+
+def test_webui_patch_settings_preserves_unknown_keys(tmp_path, monkeypatch) -> None:
+    temp_db = WebDB(tmp_path / "webui.db")
+    temp_supervisor = WebSupervisor(temp_db)
+    temp_db.set_settings("app_settings", {"rollCommand": "wx", "UNKNOWN_FLAG": "keep-me"})
+    temp_db.set_settings("ui_settings", {"theme": "system"})
+
+    monkeypatch.setattr(WebServer, "db", temp_db)
+    monkeypatch.setattr(WebServer, "supervisor", temp_supervisor)
+    monkeypatch.setattr(WebServer, "build_initial_import_bundle", lambda: {"accounts": [], "wishlists": {"global": [], "accounts": {}}})
+
+    with TestClient(WebServer.app) as client:
+        response = client.patch("/api/settings", json={"app_settings": {"rollCommand": "wa"}, "ui_settings": {"theme": "dark"}})
+
+    payload = response.json()
+
+    assert response.status_code == 200
+    assert payload["app_settings"]["rollCommand"] == "wa"
+    assert payload["app_settings"]["UNKNOWN_FLAG"] == "keep-me"
+    assert payload["ui_settings"]["theme"] == "dark"
+
+
+def test_webui_patch_settings_returns_field_errors_for_invalid_values(tmp_path, monkeypatch) -> None:
+    temp_db = WebDB(tmp_path / "webui.db")
+    temp_supervisor = WebSupervisor(temp_db)
+
+    monkeypatch.setattr(WebServer, "db", temp_db)
+    monkeypatch.setattr(WebServer, "supervisor", temp_supervisor)
+    monkeypatch.setattr(WebServer, "build_initial_import_bundle", lambda: {"accounts": [], "wishlists": {"global": [], "accounts": {}}})
+
+    with TestClient(WebServer.app) as client:
+        response = client.patch("/api/settings", json={"ui_settings": {"theme": "neon"}, "app_settings": {"ROLLS_PER_RESET": "oops"}})
+
+    payload = response.json()
+
+    assert response.status_code == 422
+    assert len(payload["field_errors"]) == 2
+    assert any(item["key"] == "theme" for item in payload["field_errors"])
+    assert any(item["key"] == "ROLLS_PER_RESET" for item in payload["field_errors"])

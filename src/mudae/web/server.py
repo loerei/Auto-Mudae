@@ -8,12 +8,13 @@ from typing import Any, Dict, List, Optional
 
 import uvicorn
 from fastapi import FastAPI, HTTPException, Query, WebSocket, WebSocketDisconnect
-from fastapi.responses import FileResponse, HTMLResponse, Response
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
 from mudae.web.config import DEFAULT_UI_SETTINGS, WEB_DB_PATH, build_initial_import_bundle, ensure_web_dirs, normalize_ui_settings
 from mudae.web.db import WebDB
+from mudae.web.settings_schema import apply_settings_patch, build_settings_schema
 from mudae.web.supervisor import SUPPORTED_MODES, WebSupervisor
 
 
@@ -35,6 +36,11 @@ class WishlistItemPayload(BaseModel):
 class SettingsPayload(BaseModel):
     app_settings: Dict[str, Any] = Field(default_factory=dict)
     ui_settings: Dict[str, Any] = Field(default_factory=dict)
+
+
+class SettingsPatchPayload(BaseModel):
+    app_settings: Optional[Dict[str, Any]] = None
+    ui_settings: Optional[Dict[str, Any]] = None
 
 
 class QueuePayload(BaseModel):
@@ -256,12 +262,40 @@ def get_settings() -> Dict[str, Any]:
     }
 
 
+@app.get("/api/settings/schema")
+def get_settings_schema() -> Dict[str, Any]:
+    return build_settings_schema(
+        app_settings=db.get_settings("app_settings", {}),
+        ui_settings=db.get_settings("ui_settings", DEFAULT_UI_SETTINGS),
+    )
+
+
 @app.put("/api/settings")
 def put_settings(payload: SettingsPayload) -> Dict[str, Any]:
     app_settings = db.set_settings("app_settings", payload.app_settings)
     merged_ui = normalize_ui_settings({**db.get_settings("ui_settings", DEFAULT_UI_SETTINGS), **payload.ui_settings})
     ui_settings = db.set_settings("ui_settings", merged_ui)
     return {"app_settings": app_settings, "ui_settings": ui_settings}
+
+
+@app.patch("/api/settings")
+def patch_settings(payload: SettingsPatchPayload) -> Response:
+    current_app = db.get_settings("app_settings", {})
+    current_ui = db.get_settings("ui_settings", DEFAULT_UI_SETTINGS)
+    app_settings, ui_settings, field_errors = apply_settings_patch(
+        current_app_settings=current_app,
+        current_ui_settings=current_ui,
+        app_patch=payload.app_settings,
+        ui_patch=payload.ui_settings,
+    )
+    if field_errors:
+        return JSONResponse(
+            status_code=422,
+            content={"message": "Validation failed.", "field_errors": field_errors},
+        )
+    saved_app = db.set_settings("app_settings", app_settings)
+    saved_ui = db.set_settings("ui_settings", ui_settings)
+    return JSONResponse(status_code=200, content={"app_settings": saved_app, "ui_settings": saved_ui})
 
 
 @app.get("/api/queue")

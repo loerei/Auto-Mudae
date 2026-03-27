@@ -173,6 +173,67 @@ export type SettingsPayload = {
   ui_settings: UISettings;
 };
 
+export type SettingsSource = "app_settings" | "ui_settings";
+
+export type SettingsOption = {
+  value: string;
+  label: string;
+};
+
+export type SettingsValidation = {
+  min?: number;
+  max?: number;
+  step?: number;
+  allow_blank?: boolean;
+  allowed_keys?: string[];
+  value_kind?: string;
+  pair_labels?: string[];
+  [key: string]: unknown;
+};
+
+export type SettingsField = {
+  key: string;
+  source: SettingsSource;
+  section: string;
+  label: string;
+  description: string;
+  editor: string;
+  value_type: string;
+  default: unknown;
+  value: unknown;
+  options: SettingsOption[];
+  validation: SettingsValidation;
+  apply_scope: string;
+  dangerous: boolean;
+  editable: boolean;
+};
+
+export type SettingsSection = {
+  id: string;
+  title: string;
+  description: string;
+  fields: SettingsField[];
+};
+
+export type UnknownSetting = {
+  source: SettingsSource;
+  key: string;
+  label: string;
+  value: unknown;
+};
+
+export type SettingsSchema = {
+  sections: SettingsSection[];
+  unknown_app_settings: UnknownSetting[];
+  sources: Record<string, string>;
+};
+
+export type FieldError = {
+  source: SettingsSource;
+  key: string;
+  message: string;
+};
+
 export type WishlistPayload = {
   global: WishlistItem[];
   accounts: Record<string, WishlistItem[]>;
