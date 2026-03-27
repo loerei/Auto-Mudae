@@ -167,6 +167,58 @@ def filter_messages(
     return results
 
 
+def _find_soft_interaction_matches(
+    messages: List[Dict[str, Any]],
+    *,
+    user_id: Optional[str] = None,
+    user_name: Optional[str] = None,
+    command_name: Optional[str] = None,
+    interaction_id: Optional[str] = None,
+    require_interaction: bool = False,
+) -> List[Dict[str, Any]]:
+    if interaction_id and (user_id or user_name):
+        return filter_messages(
+            messages,
+            user_id=user_id,
+            user_name=user_name,
+            command_name=command_name,
+            require_interaction=require_interaction,
+        )
+    if interaction_id and not (user_id or user_name):
+        return filter_messages(
+            messages,
+            interaction_id=interaction_id,
+            command_name=command_name,
+            require_interaction=require_interaction,
+        )
+    return []
+
+
+def _find_relevant_interaction_messages(
+    messages: List[Dict[str, Any]],
+    *,
+    command_name: Optional[str] = None,
+    require_interaction: bool = False,
+) -> List[Dict[str, Any]]:
+    if command_name:
+        command_matches = filter_messages(
+            messages,
+            command_name=command_name,
+            require_interaction=require_interaction,
+        )
+        if command_matches:
+            return command_matches
+    if require_interaction:
+        interaction_messages: List[Dict[str, Any]] = []
+        for message in messages:
+            if not isinstance(message, dict):
+                continue
+            if isinstance(message.get('interaction'), dict) or isinstance(message.get('interaction_metadata'), dict):
+                interaction_messages.append(message)
+        return interaction_messages
+    return []
+
+
 def _adaptive_delay(attempt_index: int, max_delay: float) -> float:
     if max_delay <= 0:
         return 0.0
@@ -204,6 +256,7 @@ def _notify_poll_result(
     attempt_index: int,
     latency_context: Optional[str],
     on_poll_result: Optional[Callable[[Dict[str, Any]], None]],
+    metadata: Optional[Dict[str, Any]] = None,
 ) -> None:
     status_code: Optional[int] = None
     if response is not None:
@@ -225,6 +278,8 @@ def _notify_poll_result(
         "error": bool(error),
         "latency_context": latency_context,
     }
+    if metadata:
+        payload.update(metadata)
     try:
         on_poll_result(payload)
     except Exception:
@@ -258,12 +313,17 @@ def wait_for_interaction_message(
 ) -> Tuple[Optional[requests.Response], List[Dict[str, Any]], Optional[Dict[str, Any]]]:
     last_response: Optional[requests.Response] = None
     last_messages: List[Dict[str, Any]] = []
+    best_response: Optional[requests.Response] = None
+    best_observed_messages: List[Dict[str, Any]] = []
+    best_soft_candidate: Optional[Dict[str, Any]] = None
+    best_score = 0
     base_after = after_id
     schedule = _resolve_delay_schedule(attempts, delay_sec, delay_schedule)
     effective_attempts = max(max(1, attempts), len(schedule) if schedule else 0)
     for attempt_index in range(effective_attempts):
         if stop_check and stop_check():
-            return last_response, last_messages, None
+            observed = best_observed_messages if best_observed_messages else last_messages
+            return best_response or last_response, observed, best_soft_candidate
         response, messages = fetch_messages(url, auth, after_id=base_after, limit=limit)
         last_response = response
         last_messages = messages
@@ -276,9 +336,11 @@ def wait_for_interaction_message(
                 attempt_index=attempt_index,
                 latency_context=latency_context,
                 on_poll_result=on_poll_result,
+                metadata={"message_count": 0, "exact_match_count": 0, "soft_match_count": 0},
             )
             if _sleep_with_stop(_attempt_delay(attempt_index, delay_sec, schedule), stop_check):
-                return last_response, last_messages, None
+                observed = best_observed_messages if best_observed_messages else last_messages
+                return best_response or last_response, observed, best_soft_candidate
             continue
         matches = filter_messages(
             messages,
@@ -298,6 +360,31 @@ def wait_for_interaction_message(
                     command_name=command_name,
                     require_interaction=True
                 )
+        soft_matches: List[Dict[str, Any]] = []
+        if not matches:
+            soft_matches = _find_soft_interaction_matches(
+                messages,
+                user_id=user_id,
+                user_name=user_name,
+                command_name=command_name,
+                interaction_id=interaction_id,
+                require_interaction=True,
+            )
+        relevant_messages = _find_relevant_interaction_messages(
+            messages,
+            command_name=command_name,
+            require_interaction=True,
+        )
+        score = 0
+        if soft_matches:
+            score = 3
+        elif relevant_messages:
+            score = 2
+        if score > best_score:
+            best_score = score
+            best_response = response
+            best_observed_messages = list(messages)
+            best_soft_candidate = soft_matches[0] if soft_matches else best_soft_candidate
         if matches:
             _notify_poll_result(
                 response=response,
@@ -306,6 +393,11 @@ def wait_for_interaction_message(
                 attempt_index=attempt_index,
                 latency_context=latency_context,
                 on_poll_result=on_poll_result,
+                metadata={
+                    "message_count": len(messages),
+                    "exact_match_count": len(matches),
+                    "soft_match_count": len(soft_matches),
+                },
             )
             return response, messages, matches[0]
         newest = get_latest_message_id(messages)
@@ -319,19 +411,29 @@ def wait_for_interaction_message(
             attempt_index=attempt_index,
             latency_context=latency_context,
             on_poll_result=on_poll_result,
+            metadata={
+                "message_count": len(messages),
+                "exact_match_count": 0,
+                "soft_match_count": len(soft_matches),
+                "used_best_observed_batch": bool(best_observed_messages),
+            },
         )
         if retry_after is not None:
             wait_delay = max(retry_after, _attempt_delay(attempt_index, delay_sec, schedule))
             if _sleep_with_stop(wait_delay, stop_check):
-                return last_response, last_messages, None
+                observed = best_observed_messages if best_observed_messages else last_messages
+                return best_response or last_response, observed, best_soft_candidate
             continue
         if response.status_code >= 500:
             if _sleep_with_stop(max(_attempt_delay(attempt_index, delay_sec, schedule), 1.0), stop_check):
-                return last_response, last_messages, None
+                observed = best_observed_messages if best_observed_messages else last_messages
+                return best_response or last_response, observed, best_soft_candidate
             continue
         if _sleep_with_stop(_attempt_delay(attempt_index, delay_sec, schedule), stop_check):
-            return last_response, last_messages, None
-    return last_response, last_messages, None
+            observed = best_observed_messages if best_observed_messages else last_messages
+            return best_response or last_response, observed, best_soft_candidate
+    observed = best_observed_messages if best_observed_messages else last_messages
+    return best_response or last_response, observed, best_soft_candidate
 
 
 def wait_for_author_message(

@@ -12,7 +12,7 @@ def test_webui_overview_bootstraps_seeded_account(tmp_path, monkeypatch) -> None
     temp_supervisor = WebSupervisor(temp_db)
     bundle = {
         "app_settings": {"MACHINE_TAG": "test-webui"},
-        "ui_settings": {"bind_host": "127.0.0.1", "bind_port": 8765, "retention_days": 30, "auto_open_browser": False},
+        "ui_settings": {"bind_host": "127.0.0.1", "bind_port": 8765, "retention_days": 30, "auto_open_browser": False, "theme": "dark"},
         "accounts": [
             {
                 "name": "Alpha",
@@ -52,6 +52,7 @@ def test_webui_overview_bootstraps_seeded_account(tmp_path, monkeypatch) -> None
     assert wishlist_payload["global"][0]["is_star"] is True
     assert settings.status_code == 200
     assert settings_payload["app_settings"]["MACHINE_TAG"] == "test-webui"
+    assert settings_payload["ui_settings"]["theme"] == "dark"
 
 
 def test_webui_force_stop_and_clear_queue_endpoints_are_available(tmp_path, monkeypatch) -> None:
@@ -71,3 +72,25 @@ def test_webui_force_stop_and_clear_queue_endpoints_are_available(tmp_path, monk
     assert clear_response.json()["cleared"] == 0
     assert stop_response.status_code == 200
     assert stop_response.json()["snapshot"]["status"] == "stopped"
+
+
+def test_webui_put_settings_normalizes_theme_defaults(tmp_path, monkeypatch) -> None:
+    temp_db = WebDB(tmp_path / "webui.db")
+    temp_supervisor = WebSupervisor(temp_db)
+
+    monkeypatch.setattr(WebServer, "db", temp_db)
+    monkeypatch.setattr(WebServer, "supervisor", temp_supervisor)
+    monkeypatch.setattr(WebServer, "build_initial_import_bundle", lambda: {"accounts": [], "wishlists": {"global": [], "accounts": {}}})
+
+    with TestClient(WebServer.app) as client:
+        response = client.put(
+            "/api/settings",
+            json={"app_settings": {"MACHINE_TAG": "theme-test"}, "ui_settings": {"theme": "light", "retention_days": 0}},
+        )
+
+    payload = response.json()
+
+    assert response.status_code == 200
+    assert payload["app_settings"]["MACHINE_TAG"] == "theme-test"
+    assert payload["ui_settings"]["theme"] == "light"
+    assert payload["ui_settings"]["retention_days"] == 1

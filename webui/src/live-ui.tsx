@@ -284,21 +284,22 @@ export function OverviewCard(props: {
       </div>
       <p className="muted">{snapshot.last_message || snapshot.last_action || "No live events yet."}</p>
       <div className="button-row">
-        <button className="primary" onClick={() => onAction("main", "start")}>Start Main</button>
+        <button className="primary" onClick={onOpen}>Open Live</button>
+        <button onClick={() => onAction("main", "start")}>Start Main</button>
+        {snapshot.status === "paused" ? (
+          <button onClick={() => onAction(snapshot.active_mode || snapshot.paused_mode || "main", "resume")}>Resume</button>
+        ) : (
+          <button onClick={() => onAction(snapshot.active_mode || "main", "pause")}>Pause</button>
+        )}
+        <button className="danger ghost" onClick={props.onForceStop}>Force Stop</button>
+      </div>
+      <div className="button-row">
         <button onClick={() => onAction("oh", "start")}>OH</button>
         <button onClick={() => onAction("oc", "start")}>OC</button>
         <button onClick={() => onAction("oq", "start")}>OQ</button>
-      </div>
-      <div className="button-row">
-        <button onClick={onOpen}>Open Live</button>
-        <button onClick={() => onAction(snapshot.active_mode || "main", "pause")}>Pause</button>
-        <button onClick={() => onAction(snapshot.active_mode || "main", "resume")}>Resume</button>
-        <button className="danger" onClick={() => onAction(snapshot.active_mode || "main", "stop")}>Stop</button>
-      </div>
-      <div className="button-row">
-        <button className="danger ghost" onClick={props.onForceStop}>Force Stop</button>
         <button onClick={props.onClearQueue}>Clear Queue</button>
       </div>
+      <p className="muted">Use Accounts &gt; Live for queue details, schedules, and the full dashboard.</p>
     </motion.article>
   );
 }

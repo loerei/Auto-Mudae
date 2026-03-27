@@ -23,6 +23,24 @@ def test_webui_normalize_wishlist_items_supports_structured_rows() -> None:
     ]
 
 
+def test_webui_normalize_ui_settings_adds_theme_and_sanitizes_values() -> None:
+    settings = WebConfig.normalize_ui_settings(
+        {
+            "bind_host": "0.0.0.0",
+            "bind_port": "9001",
+            "retention_days": 0,
+            "auto_open_browser": "false",
+            "theme": "neon",
+        }
+    )
+
+    assert settings["bind_host"] == "0.0.0.0"
+    assert settings["bind_port"] == 9001
+    assert settings["retention_days"] == 1
+    assert settings["auto_open_browser"] is False
+    assert settings["theme"] == "system"
+
+
 def test_webui_reset_runtime_state_marks_live_records_stopped(tmp_path) -> None:
     db = WebDB(tmp_path / "webui.db")
     account = db.upsert_account({"name": "Alpha", "token": "token-alpha", "max_power": 111})

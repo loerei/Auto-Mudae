@@ -1354,6 +1354,125 @@ def _get_discord_username_for_config_id(config_id: int) -> Optional[str]:
     return None
 
 
+def _build_account_identity_names(token: str, primary_name: Optional[str] = None) -> List[str]:
+    names: List[str] = []
+    seen: Set[str] = set()
+
+    def _add(name: Optional[str]) -> None:
+        if not isinstance(name, str):
+            return
+        clean = name.strip()
+        if not clean:
+            return
+        lowered = clean.lower()
+        if lowered in seen:
+            return
+        seen.add(lowered)
+        names.append(clean)
+
+    _add(primary_name)
+    _add(_get_user_name_for_token(token))
+    entry = _get_token_config_entry(token) or {}
+    _add(cast(Optional[str], entry.get('discordusername')))
+    _add(cast(Optional[str], entry.get('name')))
+    _add(current_user_name)
+    return names
+
+
+def _extract_tu_content_name(message: Dict[str, Any]) -> Optional[str]:
+    content = message.get('content', '')
+    if not isinstance(content, str):
+        return None
+    match = re.search(r'^\*\*(.+?)\*\*,\s+you', content, re.IGNORECASE)
+    if not match:
+        return None
+    return match.group(1).strip()
+
+
+def _message_matches_identity_names(message: Dict[str, Any], allowed_names: List[str]) -> bool:
+    if not allowed_names:
+        return False
+    normalized = {name.lower() for name in allowed_names if isinstance(name, str) and name.strip()}
+    if not normalized:
+        return False
+    interaction_name = Fetch.extract_interaction_user_name(message)
+    if interaction_name and interaction_name.lower() in normalized:
+        return True
+    content_name = _extract_tu_content_name(message)
+    if content_name and content_name.lower() in normalized:
+        return True
+    return False
+
+
+def _select_tu_response_message(
+    messages: List[Dict[str, Any]],
+    *,
+    token: str,
+    user_id: Optional[str],
+    user_name: Optional[str],
+    interaction_id: Optional[str],
+) -> Tuple[Optional[Dict[str, Any]], str]:
+    if interaction_id and user_id:
+        exact_candidates = _filter_messages_with_interaction(
+            messages,
+            user_id=user_id,
+            command_name='tu',
+            interaction_id=interaction_id,
+            require_interaction=True,
+        )
+        if exact_candidates:
+            return exact_candidates[0], "exact_interaction_user"
+
+    if user_id:
+        user_candidates = _filter_messages_with_interaction(
+            messages,
+            user_id=user_id,
+            command_name='tu',
+            require_interaction=True,
+        )
+        if user_candidates:
+            return user_candidates[0], "user_command"
+
+    allowed_names = _build_account_identity_names(token, user_name)
+    if allowed_names:
+        for message in messages:
+            if not isinstance(message, dict):
+                continue
+            command = Fetch.extract_interaction_name(message)
+            if command != 'tu':
+                continue
+            if _message_matches_identity_names(message, allowed_names):
+                return message, "name_match"
+
+    if allowed_names:
+        tu_candidates: List[Dict[str, Any]] = []
+        for message in messages:
+            if not isinstance(message, dict):
+                continue
+            author = message.get('author', {})
+            if not isinstance(author, dict) or str(author.get('id', '')) != str(botID):
+                continue
+            if not _message_matches_identity_names(message, allowed_names):
+                continue
+            content = message.get('content', '')
+            if _parse_tu_message(content):
+                tu_candidates.append(message)
+        if len(tu_candidates) == 1:
+            return tu_candidates[0], "single_tu_for_expected_user"
+
+    if interaction_id and not user_id:
+        interaction_candidates = _filter_messages_with_interaction(
+            messages,
+            command_name='tu',
+            interaction_id=interaction_id,
+            require_interaction=True,
+        )
+        if len(interaction_candidates) == 1:
+            return interaction_candidates[0], "interaction_only"
+
+    return None, "none"
+
+
 def _get_target_mention_for_config_id(config_id: int) -> Tuple[Optional[str], Optional[str], str]:
     user_id = _get_discord_user_id_for_config_id(config_id)
     username = _get_discord_username_for_config_id(config_id)
@@ -3418,14 +3537,6 @@ def getTuInfo(token: str) -> Optional[Dict[str, Any]]:
         resolved_id, resolved_name = _ensure_user_identity(token)
         user_id = resolved_id
         user_name = resolved_name
-        fallback_names: List[str] = []
-        if user_name:
-            fallback_names.append(user_name)
-        token_name = getUserNameForToken(token)
-        if token_name and token_name.lower() not in {n.lower() for n in fallback_names}:
-            fallback_names.append(token_name)
-        if current_user_name and current_user_name.lower() not in {n.lower() for n in fallback_names}:
-            fallback_names.append(current_user_name)
         
         tuCommand = getSlashCommand(bot, ['tu'])
         if not tuCommand:
@@ -3460,79 +3571,24 @@ def getTuInfo(token: str) -> Optional[Dict[str, Any]]:
 
         if not jsonResponse:
             return None
-        
-        if not our_message:
-            candidates = _filter_messages_with_interaction(
-                jsonResponse,
-                user_id=user_id,
-                user_name=user_name if not user_id else None,
-                command_name='tu',
-                interaction_id=interaction_id,
-                require_interaction=True
-            )
-            if candidates:
-                our_message = candidates[0]
 
-        if not our_message and user_name:
-            name_pattern = re.compile(rf'^\*\*{re.escape(user_name)}\*\*, you', re.IGNORECASE)
-            for msg in jsonResponse:
-                if not isinstance(msg, dict):
-                    continue
-                content = msg.get('content', '')
-                if name_pattern.search(content):
-                    our_message = msg
-                    break
-
-        if not our_message:
-            fallback_names: List[str] = []
-            if user_name:
-                fallback_names.append(user_name)
-            token_name = getUserNameForToken(token)
-            if token_name and token_name.lower() not in {n.lower() for n in fallback_names}:
-                fallback_names.append(token_name)
-            if current_user_name and current_user_name.lower() not in {n.lower() for n in fallback_names}:
-                fallback_names.append(current_user_name)
-            if fallback_names:
-                any_name_pattern = re.compile(r'^\*\*(.+?)\*\*,\s+you', re.IGNORECASE)
-                for msg in jsonResponse:
-                    if not isinstance(msg, dict):
-                        continue
-                    content = msg.get('content', '')
-                    match = any_name_pattern.search(content)
-                    if not match:
-                        continue
-                    content_name = match.group(1).strip()
-                    if any(content_name.lower() == name.lower() for name in fallback_names):
-                        our_message = msg
-                        break
-
-        if not our_message:
-            tu_candidates: List[Dict[str, Any]] = []
-            for msg in jsonResponse:
-                if not isinstance(msg, dict):
-                    continue
-                author = msg.get('author', {})
-                if not isinstance(author, dict) or str(author.get('id', '')) != str(botID):
-                    continue
-                content = msg.get('content', '')
-                if _parse_tu_message(content):
-                    tu_candidates.append(msg)
-            if len(tu_candidates) == 1:
-                our_message = tu_candidates[0]
-
-        if not our_message and not user_id:
-            candidates = _filter_messages_with_interaction(
-                jsonResponse,
-                command_name='tu',
-                interaction_id=interaction_id,
-                require_interaction=True
-            )
-            if len(candidates) == 1:
-                our_message = candidates[0]
+        match_reason = "prefetched" if our_message else "none"
+        selected_message, selected_reason = _select_tu_response_message(
+            jsonResponse,
+            token=token,
+            user_id=user_id,
+            user_name=user_name,
+            interaction_id=interaction_id,
+        )
+        if selected_message is not None:
+            our_message = selected_message
+            match_reason = selected_reason
 
         if not our_message:
             log("Warning: No response from our user in /tu (responses received but none matched our user ID)")
             return None
+        if match_reason not in {"none", "exact_interaction_user"}:
+            log(f"Info: Matched /tu response via {match_reason}")
 
         _mark_last_seen(Vars.channelId, cast(Optional[str], our_message.get('id')))
         

@@ -14,7 +14,7 @@ from typing import Any, Dict, List, Optional
 
 from mudae.storage.atomic import atomic_write_json
 from mudae.web.bridge import EVENT_PREFIX
-from mudae.web.config import worker_paths
+from mudae.web.config import normalize_ui_settings, worker_paths
 from mudae.web.db import WebDB
 
 
@@ -317,7 +317,7 @@ class WebSupervisor:
 
     def _build_worker_payload(self, account_id: int, mode: str, session_id: str, control_path: str) -> Dict[str, Any]:
         app_settings = self.db.get_settings("app_settings", {})
-        ui_settings = self.db.get_settings("ui_settings", {})
+        ui_settings = normalize_ui_settings(self.db.get_settings("ui_settings", {}))
         accounts = self.db.list_accounts()
         global_wishlist = self.db.list_wishlist(None)
         account_wishlist = self.db.list_wishlist(account_id)
@@ -545,7 +545,7 @@ class WebSupervisor:
 
     def _prune_loop(self) -> None:
         while not self._shutdown.is_set():
-            ui_settings = self.db.get_settings("ui_settings", {})
+            ui_settings = normalize_ui_settings(self.db.get_settings("ui_settings", {}))
             retention_days = int(ui_settings.get("retention_days") or 30)
             self.db.prune_old_data(retention_days=retention_days)
             self._shutdown.wait(300.0)

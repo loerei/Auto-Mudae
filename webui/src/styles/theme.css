@@ -1,0 +1,110 @@
+:root {
+  font-family: "Segoe UI", "IBM Plex Sans", sans-serif;
+  --radius-sm: 16px;
+  --radius-md: 22px;
+  --radius-lg: 28px;
+  --shadow-panel: 0 24px 60px rgba(44, 28, 12, 0.08);
+  --shadow-raised: 0 16px 40px rgba(44, 28, 12, 0.12);
+  --focus-ring: rgba(149, 94, 40, 0.32);
+  color-scheme: light;
+}
+
+:root,
+:root[data-theme="light"] {
+  --bg-app: #f4ede3;
+  --bg-shell: radial-gradient(circle at top left, rgba(255, 232, 196, 0.94), transparent 32%),
+    linear-gradient(180deg, #f6f1ea 0%, #ece1d4 100%);
+  --surface-primary: rgba(255, 252, 247, 0.86);
+  --surface-secondary: rgba(255, 247, 236, 0.92);
+  --surface-subtle: rgba(255, 244, 229, 0.78);
+  --surface-strong: #201913;
+  --text-primary: #1f1a14;
+  --text-secondary: #4b3c2f;
+  --text-muted: #74604f;
+  --text-contrast: #fff8ef;
+  --border-soft: rgba(120, 88, 54, 0.16);
+  --border-strong: rgba(120, 88, 54, 0.3);
+  --accent: #8f5b28;
+  --accent-strong: #6c4520;
+  --accent-soft: rgba(223, 192, 157, 0.88);
+  --success-soft: #d8f1d7;
+  --warning-soft: #f5e4b6;
+  --danger-soft: #f4cbcb;
+  --info-soft: #d9ebff;
+  --button-bg: #fff7ec;
+  --button-hover: #f7e2c1;
+  --button-primary-bg: #1f1a14;
+  --button-primary-fg: #fff8ef;
+  --danger-bg: #8c3131;
+  --danger-fg: #fff5f5;
+  --danger-plain: #8c3131;
+}
+
+:root[data-theme="dark"] {
+  --bg-app: #17120f;
+  --bg-shell: radial-gradient(circle at top left, rgba(151, 94, 43, 0.24), transparent 30%),
+    linear-gradient(180deg, #18120f 0%, #0f0b09 100%);
+  --surface-primary: rgba(30, 23, 18, 0.9);
+  --surface-secondary: rgba(38, 29, 23, 0.92);
+  --surface-subtle: rgba(55, 42, 33, 0.75);
+  --surface-strong: #f4ede3;
+  --text-primary: #f5ede3;
+  --text-secondary: #ddc8b2;
+  --text-muted: #b19883;
+  --text-contrast: #150f0b;
+  --border-soft: rgba(221, 195, 166, 0.14);
+  --border-strong: rgba(221, 195, 166, 0.28);
+  --accent: #d19657;
+  --accent-strong: #f0be84;
+  --accent-soft: rgba(109, 73, 43, 0.82);
+  --success-soft: rgba(79, 120, 71, 0.54);
+  --warning-soft: rgba(157, 119, 46, 0.56);
+  --danger-soft: rgba(143, 68, 68, 0.62);
+  --info-soft: rgba(62, 92, 133, 0.6);
+  --button-bg: rgba(50, 38, 29, 0.96);
+  --button-hover: rgba(68, 52, 40, 0.98);
+  --button-primary-bg: #f2e3d1;
+  --button-primary-fg: #1a130d;
+  --danger-bg: #d67171;
+  --danger-fg: #190c0c;
+  --danger-plain: #f1a6a6;
+  --shadow-panel: 0 24px 60px rgba(0, 0, 0, 0.34);
+  --shadow-raised: 0 18px 48px rgba(0, 0, 0, 0.44);
+  --focus-ring: rgba(240, 190, 132, 0.34);
+  color-scheme: dark;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body,
+#root {
+  min-height: 100%;
+}
+
+body {
+  margin: 0;
+  background: var(--bg-shell);
+  color: var(--text-primary);
+}
+
+button,
+input,
+select,
+textarea {
+  font: inherit;
+}
+
+h1,
+h2,
+h3,
+h4,
+p {
+  margin-top: 0;
+}
+
+p:last-child {
+  margin-bottom: 0;
+}

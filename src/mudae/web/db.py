@@ -7,6 +7,8 @@ import time
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Sequence
 
+from mudae.web.config import normalize_ui_settings
+
 
 def _dump_json(value: Any) -> str:
     return json.dumps(value, ensure_ascii=False, separators=(",", ":"))
@@ -784,7 +786,7 @@ class WebDB:
         accounts = self.list_accounts()
         return {
             "app_settings": self.get_settings("app_settings", {}),
-            "ui_settings": self.get_settings("ui_settings", {}),
+            "ui_settings": normalize_ui_settings(self.get_settings("ui_settings", {})),
             "accounts": accounts,
             "wishlists": {
                 "global": self.list_wishlist(None),
@@ -807,7 +809,7 @@ class WebDB:
             self._conn.execute("DELETE FROM accounts")
             self._conn.commit()
         self.set_settings("app_settings", bundle.get("app_settings") or {})
-        self.set_settings("ui_settings", bundle.get("ui_settings") or {})
+        self.set_settings("ui_settings", normalize_ui_settings(bundle.get("ui_settings") or {}))
         account_map: Dict[str, int] = {}
         for account in accounts:
             saved = self.upsert_account(account)

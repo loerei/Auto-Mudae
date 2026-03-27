@@ -16,6 +16,7 @@ DEFAULT_UI_SETTINGS: Dict[str, Any] = {
     "bind_port": 8765,
     "retention_days": 30,
     "auto_open_browser": True,
+    "theme": "system",
 }
 
 
@@ -83,7 +84,7 @@ def build_initial_import_bundle() -> Dict[str, Any]:
     accounts = [normalize_account_record(record) for record in getattr(Vars, "tokens", [])]
     return {
         "app_settings": collect_mudae_settings(),
-        "ui_settings": copy.deepcopy(DEFAULT_UI_SETTINGS),
+        "ui_settings": normalize_ui_settings(copy.deepcopy(DEFAULT_UI_SETTINGS)),
         "accounts": accounts,
         "wishlists": {
             "global": global_items,
@@ -118,6 +119,23 @@ def worker_paths(worker_id: str) -> Dict[str, Any]:
     }
 
 
+def normalize_ui_settings(settings: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    raw = {**DEFAULT_UI_SETTINGS, **dict(settings or {})}
+    theme = str(raw.get("theme") or DEFAULT_UI_SETTINGS["theme"]).strip().lower()
+    if theme not in {"system", "light", "dark"}:
+        theme = str(DEFAULT_UI_SETTINGS["theme"])
+    bind_port = _normalize_int(raw.get("bind_port"))
+    retention_days = _normalize_int(raw.get("retention_days"))
+    return {
+        **raw,
+        "bind_host": str(raw.get("bind_host") or DEFAULT_UI_SETTINGS["bind_host"]),
+        "bind_port": bind_port if bind_port and bind_port > 0 else int(DEFAULT_UI_SETTINGS["bind_port"]),
+        "retention_days": max(1, retention_days if retention_days is not None else int(DEFAULT_UI_SETTINGS["retention_days"])),
+        "auto_open_browser": _normalize_bool(raw.get("auto_open_browser"), bool(DEFAULT_UI_SETTINGS["auto_open_browser"])),
+        "theme": theme,
+    }
+
+
 def _normalize_int(value: Any) -> Optional[int]:
     try:
         if value is None or value == "":
@@ -130,3 +148,17 @@ def _normalize_int(value: Any) -> Optional[int]:
 def _normalize_str(value: Any) -> Optional[str]:
     text = str(value).strip() if value is not None else ""
     return text or None
+
+
+def _normalize_bool(value: Any, default: bool) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        lowered = value.strip().lower()
+        if lowered in {"1", "true", "yes", "on"}:
+            return True
+        if lowered in {"0", "false", "no", "off"}:
+            return False
+    if value is None:
+        return default
+    return bool(value)

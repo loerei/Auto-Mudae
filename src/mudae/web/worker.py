@@ -64,6 +64,11 @@ def _format_next_action_time(seconds: int) -> str:
     return time.strftime("%H:%M:%S", target)
 
 
+def _no_reset_retry_delay_seconds(failures: int) -> int:
+    attempts = max(1, int(failures))
+    return min(300, 30 * (2 ** (attempts - 1)))
+
+
 def _sleep_with_control(seconds: float, control: ControlReader, *, token: Optional[str] = None) -> str:
     from mudae.core.session_engine import pollExternalRolls
 
@@ -169,6 +174,7 @@ def _run_main_mode(payload: Dict[str, Any], control: ControlReader) -> int:
     initializeSession(current_token, user_name)
     setDashboardState("READY", last_action="Session initialized")
     emit_worker_status("running", mode="main")
+    tu_retry_failures = 0
 
     while True:
         desired = control.desired()
@@ -192,6 +198,7 @@ def _run_main_mode(payload: Dict[str, Any], control: ControlReader) -> int:
                 return EXIT_STOPPED
 
             if tu_info and tu_info.get("next_reset_min", 0) >= 0:
+                tu_retry_failures = 0
                 next_roll_sec, next_claim_sec = calculateFixedResetSeconds()
                 next_roll_min = (next_roll_sec + 59) // 60 if next_roll_sec > 0 else 0
                 next_claim_min = (next_claim_sec + 59) // 60 if next_claim_sec > 0 else 0
@@ -231,15 +238,20 @@ def _run_main_mode(payload: Dict[str, Any], control: ControlReader) -> int:
                 if desired == "stop":
                     return EXIT_STOPPED
             else:
-                log_warn("No reset time available, waiting 5 seconds before retry...")
-                next_action_time = _format_next_action_time(5)
+                tu_retry_failures += 1
+                wait_seconds = _no_reset_retry_delay_seconds(tu_retry_failures)
+                log_warn(
+                    f"No reset time available after /tu fetch, waiting {wait_seconds} seconds before retry "
+                    f"(attempt {tu_retry_failures}, capped at 300 seconds)..."
+                )
+                next_action_time = _format_next_action_time(wait_seconds)
                 setDashboardState(
                     "WAITING",
-                    last_action="No reset time available",
+                    last_action="No reset time available after /tu fetch",
                     next_action=f"Retry at {next_action_time}",
                 )
                 setConnectionStatus("Connected")
-                desired = _countdown(5, control, token=current_token)
+                desired = _countdown(wait_seconds, control, token=current_token)
                 if desired == "pause":
                     return EXIT_PAUSED
                 if desired == "stop":

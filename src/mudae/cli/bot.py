@@ -240,6 +240,11 @@ def main():
         target = time.localtime(time.time() + seconds)
         return time.strftime("%H:%M:%S", target)
 
+
+    def _no_reset_retry_delay_seconds(failures: int) -> int:
+        attempts = max(1, int(failures))
+        return min(300, 30 * (2 ** (attempts - 1)))
+
     def _scan_interval_bounds(remaining_sec: int) -> tuple[float, float]:
         if remaining_sec >= 60 * 30:
             return (0.8, 3.0)
@@ -482,6 +487,7 @@ def main():
 
     # Main loop - run continuously
     try:
+        tu_retry_failures = 0
         while not stop_requested:
             try:
                 # Check if restart was requested
@@ -504,6 +510,7 @@ def main():
 
                 # Determine when next rolls will be available
                 if tu_info and tu_info.get('next_reset_min', 0) >= 0:
+                    tu_retry_failures = 0
                     next_roll_sec, next_claim_sec = calculateFixedResetSeconds()
                     next_roll_min = (next_roll_sec + 59) // 60 if next_roll_sec > 0 else 0
                     next_claim_min = (next_claim_sec + 59) // 60 if next_claim_sec > 0 else 0
@@ -550,12 +557,16 @@ def main():
                     # Loop will continue and run again
                     log("="*50)
                 else:
-                    log_warn("No reset time available, waiting 5 seconds before retry...")
-                    wait_seconds = 5
+                    tu_retry_failures += 1
+                    wait_seconds = _no_reset_retry_delay_seconds(tu_retry_failures)
+                    log_warn(
+                        f"No reset time available after /tu fetch, waiting {wait_seconds} seconds before retry "
+                        f"(attempt {tu_retry_failures}, capped at 300 seconds)..."
+                    )
                     next_action_time = _format_next_action_time(wait_seconds)
                     setDashboardState(
                         "WAITING",
-                        last_action="No reset time available",
+                        last_action="No reset time available after /tu fetch",
                         next_action=f"Retry at {next_action_time}"
                     )
                     setConnectionStatus("Connected")

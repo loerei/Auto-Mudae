@@ -12,7 +12,7 @@ from fastapi.responses import FileResponse, HTMLResponse, Response
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
-from mudae.web.config import DEFAULT_UI_SETTINGS, WEB_DB_PATH, build_initial_import_bundle, ensure_web_dirs
+from mudae.web.config import DEFAULT_UI_SETTINGS, WEB_DB_PATH, build_initial_import_bundle, ensure_web_dirs, normalize_ui_settings
 from mudae.web.db import WebDB
 from mudae.web.supervisor import SUPPORTED_MODES, WebSupervisor
 
@@ -76,7 +76,9 @@ def _bootstrap_defaults() -> None:
     if not current_settings:
         db.set_settings("app_settings", bundle.get("app_settings") or {})
     if not current_ui:
-        db.set_settings("ui_settings", bundle.get("ui_settings") or DEFAULT_UI_SETTINGS)
+        db.set_settings("ui_settings", normalize_ui_settings(bundle.get("ui_settings") or DEFAULT_UI_SETTINGS))
+    else:
+        db.set_settings("ui_settings", normalize_ui_settings(current_ui))
     if not db.list_accounts():
         for account in bundle.get("accounts") or []:
             db.upsert_account(account)
@@ -250,14 +252,14 @@ def get_logs(
 def get_settings() -> Dict[str, Any]:
     return {
         "app_settings": db.get_settings("app_settings", {}),
-        "ui_settings": db.get_settings("ui_settings", DEFAULT_UI_SETTINGS),
+        "ui_settings": normalize_ui_settings(db.get_settings("ui_settings", DEFAULT_UI_SETTINGS)),
     }
 
 
 @app.put("/api/settings")
 def put_settings(payload: SettingsPayload) -> Dict[str, Any]:
     app_settings = db.set_settings("app_settings", payload.app_settings)
-    merged_ui = {**DEFAULT_UI_SETTINGS, **payload.ui_settings}
+    merged_ui = normalize_ui_settings({**db.get_settings("ui_settings", DEFAULT_UI_SETTINGS), **payload.ui_settings})
     ui_settings = db.set_settings("ui_settings", merged_ui)
     return {"app_settings": app_settings, "ui_settings": ui_settings}
 
@@ -349,7 +351,7 @@ def spa_fallback(full_path: str) -> Response:
 
 
 def main() -> None:
-    ui_settings = db.get_settings("ui_settings", DEFAULT_UI_SETTINGS)
+    ui_settings = normalize_ui_settings(db.get_settings("ui_settings", DEFAULT_UI_SETTINGS))
     host = str(ui_settings.get("bind_host") or DEFAULT_UI_SETTINGS["bind_host"])
     port = int(ui_settings.get("bind_port") or DEFAULT_UI_SETTINGS["bind_port"])
     uvicorn.run("mudae.web.server:app", host=host, port=port, reload=False)

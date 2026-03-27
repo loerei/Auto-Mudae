@@ -1,3 +1,16 @@
+export type ThemeMode = "system" | "light" | "dark";
+
+export type ResolvedTheme = "light" | "dark";
+
+export type UISettings = {
+  bind_host: string;
+  bind_port: number;
+  retention_days: number;
+  auto_open_browser: boolean;
+  theme: ThemeMode;
+  [key: string]: unknown;
+};
+
 export type QueueItem = {
   id: number;
   account_id: number;
@@ -157,7 +170,7 @@ export type OverviewPayload = {
 
 export type SettingsPayload = {
   app_settings: Record<string, unknown>;
-  ui_settings: Record<string, unknown>;
+  ui_settings: UISettings;
 };
 
 export type WishlistPayload = {
