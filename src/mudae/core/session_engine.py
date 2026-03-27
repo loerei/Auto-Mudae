@@ -1,5 +1,6 @@
 ﻿from typing import Optional, Dict, Any, Tuple, List, Set, cast, Deque
 from collections import deque
+import copy
 import math
 import base64
 import hashlib
@@ -81,6 +82,14 @@ _last_seen_file_signature: Optional[Tuple[int, int]] = None
 _last_seen_lock = threading.Lock()
 _last_tu_info_cache: Dict[str, Dict[str, Any]] = {}
 _last_tu_info_at: Dict[str, float] = {}
+_last_wishlist_cache: Dict[str, Dict[str, Any]] = {}
+_last_wishlist_at: Dict[str, float] = {}
+_last_fetch_reason: Dict[str, Dict[str, str]] = {
+    "tu": {},
+    "wl": {},
+    "report": {},
+    "special": {},
+}
 _rawlog_lock = threading.Lock()
 _session_start_epoch: Dict[str, float] = {}
 _processed_manual_claim_ids: Dict[str, Set[str]] = {}
@@ -362,6 +371,47 @@ def _cache_tu_info(token: str, tu_info: Optional[Dict[str, Any]]) -> None:
     _last_tu_info_cache[token] = dict(tu_info)
     _last_tu_info_at[token] = time.time()
 
+
+def _cache_wishlist(token: str, wishlist_data: Optional[Dict[str, Any]]) -> None:
+    if not token or not wishlist_data or wishlist_data.get("status") != "success":
+        return
+    _last_wishlist_cache[token] = copy.deepcopy(wishlist_data)
+    _last_wishlist_at[token] = time.time()
+
+
+def _set_last_fetch_reason(kind: str, token: str, reason: Optional[str]) -> None:
+    if not kind or not token:
+        return
+    bucket = _last_fetch_reason.setdefault(kind, {})
+    if reason:
+        bucket[token] = str(reason)
+    else:
+        bucket.pop(token, None)
+
+
+def _get_last_fetch_reason(kind: str, token: str) -> Optional[str]:
+    if not kind or not token:
+        return None
+    return _last_fetch_reason.get(kind, {}).get(token)
+
+
+def getLastTuFetchReason(token: str) -> Optional[str]:
+    return _get_last_fetch_reason("tu", token)
+
+
+def _tu_reuse_max_age_sec() -> float:
+    try:
+        return max(0.0, float(getattr(Vars, "TU_INFO_REUSE_MAX_AGE_SEC", 90.0) or 90.0))
+    except (TypeError, ValueError):
+        return 90.0
+
+
+def _wishlist_cache_ttl_sec() -> float:
+    try:
+        return max(0.0, float(getattr(Vars, "WISHLIST_CACHE_TTL_SEC", 300.0) or 300.0))
+    except (TypeError, ValueError):
+        return 300.0
+
 def _get_cached_tu_info(token: str, max_age_sec: Optional[float] = None) -> Optional[Dict[str, Any]]:
     if not token:
         return None
@@ -376,6 +426,22 @@ def _get_cached_tu_info(token: str, max_age_sec: Optional[float] = None) -> Opti
         except (TypeError, ValueError):
             pass
     return dict(cached)
+
+
+def _get_cached_wishlist(token: str, max_age_sec: Optional[float] = None) -> Optional[Dict[str, Any]]:
+    if not token:
+        return None
+    cached = _last_wishlist_cache.get(token)
+    if not cached:
+        return None
+    timestamp = _last_wishlist_at.get(token)
+    if max_age_sec is not None and timestamp is not None:
+        try:
+            if (time.time() - float(timestamp)) > float(max_age_sec):
+                return None
+        except (TypeError, ValueError):
+            pass
+    return copy.deepcopy(cached)
 
 def _merge_tu_info(primary: Optional[Dict[str, Any]], fallback: Optional[Dict[str, Any]]) -> Dict[str, Any]:
     merged: Dict[str, Any] = {}
@@ -1464,6 +1530,62 @@ def _select_tu_response_message(
         interaction_candidates = _filter_messages_with_interaction(
             messages,
             command_name='tu',
+            interaction_id=interaction_id,
+            require_interaction=True,
+        )
+        if len(interaction_candidates) == 1:
+            return interaction_candidates[0], "interaction_only"
+
+    return None, "none"
+
+
+def _select_interaction_response_message(
+    messages: List[Dict[str, Any]],
+    *,
+    token: str,
+    command_name: str,
+    user_id: Optional[str],
+    user_name: Optional[str],
+    interaction_id: Optional[str],
+) -> Tuple[Optional[Dict[str, Any]], str]:
+    if interaction_id and user_id:
+        exact_candidates = _filter_messages_with_interaction(
+            messages,
+            user_id=user_id,
+            command_name=command_name,
+            interaction_id=interaction_id,
+            require_interaction=True,
+        )
+        if exact_candidates:
+            return exact_candidates[0], "exact_interaction_user"
+
+    if user_id:
+        user_candidates = _filter_messages_with_interaction(
+            messages,
+            user_id=user_id,
+            command_name=command_name,
+            require_interaction=True,
+        )
+        if user_candidates:
+            return user_candidates[0], "user_command"
+
+    allowed_names = _build_account_identity_names(token, user_name)
+    if allowed_names:
+        name_candidates: List[Dict[str, Any]] = []
+        for message in messages:
+            if not isinstance(message, dict):
+                continue
+            if Fetch.extract_interaction_name(message) != command_name:
+                continue
+            if _message_matches_identity_names(message, allowed_names):
+                name_candidates.append(message)
+        if len(name_candidates) == 1:
+            return name_candidates[0], "name_match"
+
+    if interaction_id and not user_id:
+        interaction_candidates = _filter_messages_with_interaction(
+            messages,
+            command_name=command_name,
             interaction_id=interaction_id,
             require_interaction=True,
         )
@@ -3288,22 +3410,17 @@ def logSessionRawResponse(label: str, response_data: Any) -> None:
         log(f"Error logging session response: {e}")
 
 def initializeSession(token: str, expected_username: str = "") -> None:
-    """Initialize logging and send initial /tu command"""
+    """Initialize logging and seed the session with a fresh or cached /tu state."""
     try:
         Latency.configure_from_vars()
         if _should_stop():
             return
-        bot, auth = getClientAndAuth(token)
-        url = getUrl()
         resolved_id, resolved_name = _ensure_user_identity(token)
-        user_id = resolved_id
         user_name = expected_username or resolved_name
-        log(f"Debug identity (pre-/tu): name={user_name or 'unknown'} id={user_id or 'unknown'}")
-        
+
         rawresponse_file = os.fspath(LOGS_DIR / 'Rawresponse.json')
         ensure_json_array_file(rawresponse_file)
-        
-        # Clear SessionRawresponse.json and start fresh for this session ONLY
+
         session_start_epoch = time.time()
         _session_start_epoch[token] = session_start_epoch
         session_start_time = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(session_start_epoch))
@@ -3336,129 +3453,26 @@ def initializeSession(token: str, expected_username: str = "") -> None:
         }, lock=_rawlog_lock)
 
         log("🔍 Initializing session...")
-        tuCommand = getSlashCommand(bot, ['tu'])
-        if not tuCommand:
-            log("Warning: /tu command not available")
+        cached_status = _get_cached_tu_info(token, _tu_reuse_max_age_sec())
+        if cached_status:
+            initial_tu_cache[token] = dict(cached_status)
+            _dashboard_set_status(cached_status)
+            render_dashboard()
+            log_info("Session initialized from fresh cached /tu state")
             return
-        _, pre_messages = Fetch.fetch_messages(url, auth, limit=1)
-        _note_last_seen_from_messages(pre_messages)
-        before_id = Fetch.get_latest_message_id(pre_messages)
-        command_sent_at = time.perf_counter()
-        trigger_result = bot.triggerSlashCommand(botID, Vars.channelId, Vars.serverId, data=tuCommand)
-        _emit_latency_event(
-            "command_sent",
-            flow="core",
-            action="tu",
-        )
-        interaction_id = _record_interaction_context(token, 'tu', user_id, trigger_result)
-        legacy_tier = Latency.get_active_tier() == "legacy"
-        if legacy_tier and _sleep_interruptible(Vars.SLEEP_SHORT_SEC):
+
+        status = getTuInfo(token)
+        if status:
+            initial_tu_cache[token] = dict(status)
+            render_dashboard()
+            log("✅ Session initialized")
             return
-        
-        # Get the response to extract our user ID
-        r, jsonResponse, our_message = Fetch.wait_for_interaction_message(
-            url,
-            auth,
-            after_id=before_id,
-            user_id=user_id,
-            user_name=user_name,
-            command_name='tu',
-            interaction_id=interaction_id,
-            attempts=4,
-            delay_sec=Vars.SLEEP_MED_SEC,
-            latency_context="core_tu_init",
-            stop_check=_should_stop
-        )
-        if r is not None:
-            logRawResponse("GET - Initial /tu command response", r)
-            logSessionRawResponse("GET - Initial /tu command response", r)
-        if jsonResponse:
-            _note_last_seen_from_messages(jsonResponse)
 
-        if our_message:
-            _mark_last_seen(Vars.channelId, cast(Optional[str], our_message.get('id')))
-            _emit_latency_event(
-                "message_detected",
-                flow="core",
-                action="tu",
-                detect_lag_ms=_latency_message_lag_ms(our_message),
-                response_ms=int((time.perf_counter() - command_sent_at) * 1000.0),
-            )
-            resolved_user_id = Fetch.extract_interaction_user_id(our_message)
-            resolved_user_name = Fetch.extract_interaction_user_name(our_message)
-            if resolved_user_id or resolved_user_name:
-                _set_user_identity_for_token(token, resolved_user_id, resolved_user_name)
-                log(f"Session initialized (User ID: {resolved_user_id or 'unknown'}, User Name: {resolved_user_name or user_name or 'unknown'})")
-                _cache_initial_tu(
-                    token,
-                    cast(str, our_message.get('content', '')),
-                    cast(Optional[str], our_message.get('timestamp'))
-                )
-                cached_status = _parse_tu_message(cast(str, our_message.get('content', '')))
-                if cached_status:
-                    cached_status['max_power'] = getMaxPowerForToken(token)
-                    _cache_tu_info(token, cached_status)
-                    _run_auto_give_from_tu(token=token, status=cached_status, url=url, auth=auth)
-                render_dashboard()
-                return
-
-        # Extract and store our user ID from the response
-        # Match by username if provided, otherwise get first valid response
-        for msg in jsonResponse:
-            try:
-                if not isinstance(msg, dict):
-                    continue
-                msg_content = msg.get('content', '')
-                # Message starts with "**username**, you..."
-                username_match = re.match(r'\*\*([^*]+)\*\*, you', msg_content)
-                if username_match:
-                    msg_username = username_match.group(1)
-                    
-                    # If expected_username provided, match exactly
-                    if expected_username:
-                        if msg_username.lower() == expected_username.lower():
-                            user_id = Fetch.extract_interaction_user_id(msg)
-                            user_name_from_msg = Fetch.extract_interaction_user_name(msg)
-                            if user_id or user_name_from_msg:
-                                _set_user_identity_for_token(token, user_id, user_name_from_msg or msg_username)
-                                log(f"Session initialized (User ID: {user_id or 'unknown'}, User Name: {user_name_from_msg or msg_username or 'unknown'})")
-                                _cache_initial_tu(
-                                    token,
-                                    cast(str, msg.get('content', '')),
-                                    cast(Optional[str], msg.get('timestamp'))
-                                )
-                                cached_status = _parse_tu_message(cast(str, msg.get('content', '')))
-                                if cached_status:
-                                    cached_status['max_power'] = getMaxPowerForToken(token)
-                                    _cache_tu_info(token, cached_status)
-                                    _run_auto_give_from_tu(token=token, status=cached_status, url=url, auth=auth)
-                                _mark_last_seen(Vars.channelId, cast(Optional[str], msg.get('id')))
-                                render_dashboard()
-                                return
-                    else:
-                        # No expected username, use first response
-                        user_id = Fetch.extract_interaction_user_id(msg)
-                        user_name_from_msg = Fetch.extract_interaction_user_name(msg)
-                        if user_id or user_name_from_msg:
-                            _set_user_identity_for_token(token, user_id, user_name_from_msg or msg_username)
-                            log(f"Session initialized (User ID: {user_id or 'unknown'}, User Name: {user_name_from_msg or msg_username or 'unknown'})")
-                            _cache_initial_tu(
-                                token,
-                                cast(str, msg.get('content', '')),
-                                cast(Optional[str], msg.get('timestamp'))
-                            )
-                            cached_status = _parse_tu_message(cast(str, msg.get('content', '')))
-                            if cached_status:
-                                cached_status['max_power'] = getMaxPowerForToken(token)
-                                _cache_tu_info(token, cached_status)
-                                _run_auto_give_from_tu(token=token, status=cached_status, url=url, auth=auth)
-                            _mark_last_seen(Vars.channelId, cast(Optional[str], msg.get('id')))
-                            render_dashboard()
-                            return
-            except (KeyError, TypeError, AttributeError):
-                continue
-        
-        log("✅ Session initialized")
+        reason = getLastTuFetchReason(token)
+        if reason == "same_account_action_busy":
+            log_info("Session initialized without startup /tu because the same-account action gate is busy")
+        else:
+            log("✅ Session initialized")
         render_dashboard()
     except Exception as e:
         log(f"❌ Error initializing session: {e}")
@@ -3531,231 +3545,280 @@ def predictStatusAfterCountdown(tu_info: Dict[str, Any], minutes_to_wait: int) -
 
 def getTuInfo(token: str) -> Optional[Dict[str, Any]]:
     """Send /tu command and extract comprehensive status information"""
+    _set_last_fetch_reason("tu", token, None)
     try:
         bot, auth = getClientAndAuth(token)
         url = getUrl()
         resolved_id, resolved_name = _ensure_user_identity(token)
         user_id = resolved_id
         user_name = resolved_name
-        
-        tuCommand = getSlashCommand(bot, ['tu'])
-        if not tuCommand:
-            log("Warning: /tu command not available")
-            return
-        _, pre_messages = Fetch.fetch_messages(url, auth, limit=1)
-        _note_last_seen_from_messages(pre_messages)
-        before_id = Fetch.get_latest_message_id(pre_messages)
-        trigger_result = bot.triggerSlashCommand(botID, Vars.channelId, Vars.serverId, data=tuCommand)
-        interaction_id = _record_interaction_context(token, 'tu', user_id, trigger_result)
-        if Latency.get_active_tier() == "legacy" and _sleep_interruptible(Vars.SLEEP_SHORT_SEC):
-            return
-
-        r, jsonResponse, our_message = Fetch.wait_for_interaction_message(
-            url,
-            auth,
-            after_id=before_id,
-            user_id=user_id,
-            user_name=user_name if not user_id else None,
-            command_name='tu',
-            interaction_id=interaction_id,
-            attempts=4,
-            delay_sec=Vars.SLEEP_MED_SEC,
-            latency_context="core_tu_status",
-            stop_check=_should_stop
-        )
-        if r is not None:
-            logRawResponse("GET - /tu command response", r)
-            logSessionRawResponse("GET - /tu command response", r)
-        if jsonResponse:
-            _note_last_seen_from_messages(jsonResponse)
-
-        if not jsonResponse:
+        fresh_cached = _get_cached_tu_info(token, _tu_reuse_max_age_sec())
+        lease, gate_allowed = _acquire_same_account_action_gate(token, user_id, user_name)
+        if not gate_allowed:
+            if fresh_cached:
+                _set_last_fetch_reason("tu", token, "cache_hit")
+                log_info("Reusing fresh cached /tu because the same-account action gate is busy")
+                return fresh_cached
+            _set_last_fetch_reason("tu", token, "same_account_action_busy")
+            log_info("Skipping /tu because the same-account action gate is busy and no fresh cache is available")
             return None
 
-        match_reason = "prefetched" if our_message else "none"
-        selected_message, selected_reason = _select_tu_response_message(
-            jsonResponse,
-            token=token,
-            user_id=user_id,
-            user_name=user_name,
-            interaction_id=interaction_id,
-        )
-        if selected_message is not None:
-            our_message = selected_message
-            match_reason = selected_reason
-
-        if not our_message:
-            log("Warning: No response from our user in /tu (responses received but none matched our user ID)")
-            return None
-        if match_reason not in {"none", "exact_interaction_user"}:
-            log(f"Info: Matched /tu response via {match_reason}")
-
-        _mark_last_seen(Vars.channelId, cast(Optional[str], our_message.get('id')))
-        
-        resolved_user_id = Fetch.extract_interaction_user_id(our_message)
-        resolved_user_name = Fetch.extract_interaction_user_name(our_message)
-        if resolved_user_id or resolved_user_name:
-            _set_user_identity_for_token(token, resolved_user_id or user_id, resolved_user_name)
-            if resolved_user_id:
-                user_id = resolved_user_id
-        
-        message: str = cast(str, our_message.get('content', ''))
-        status = _parse_tu_message(message)
-        if not status:
-            return None
-        status['max_power'] = getMaxPowerForToken(token)
-        parsed_timestamp = _parse_discord_timestamp(cast(Optional[str], our_message.get('timestamp')))
-        if parsed_timestamp:
-            status['tu_timestamp'] = parsed_timestamp
-
-        if not status.get('maintenance', False):
-            roll_sec, claim_sec = calculateFixedResetSeconds()
-            status['next_reset_sec'] = roll_sec
-            status['claim_reset_sec'] = claim_sec
-            status['next_reset_min'] = int(math.ceil(roll_sec / 60)) if roll_sec > 0 else 0
-            status['claim_reset_min'] = int(math.ceil(claim_sec / 60)) if claim_sec > 0 else 0
-
-        # Log status with new detailed format
-        detailed_status = formatDetailedStatus(status)
-        log(f"📊 Status: {detailed_status}")
-        _dashboard_set_status(status)
-        render_dashboard()
-        _cache_tu_info(token, status)
-        _run_auto_give_from_tu(token=token, status=status, url=url, auth=auth)
-        
-        return status
-    except Exception as e:
-        log(f"❌ Error getting /tu info: {e}")
-
-def useSpecialCommand(token: str, command_name: str) -> bool:
-    """Use a special command (/daily, /rolls, /dk, /rollsutil resetclaimtimer)"""
-    try:
-        bot, auth = getClientAndAuth(token)
-        url = getUrl()
-        resolved_id, resolved_name = _ensure_user_identity(token)
-        user_id = resolved_id
-        user_name = resolved_name
-
-        interaction_name = command_name.split()[0]
-        _, pre_messages = Fetch.fetch_messages(url, auth, limit=1)
-        _note_last_seen_from_messages(pre_messages)
-        before_id = Fetch.get_latest_message_id(pre_messages)
-
-        # Handle different command formats
-        if command_name == 'rollsutil resetclaimtimer':
-            # This is a slash command: /rollsutil resetclaimtimer
-            cmd = getSlashCommand(bot, ['rollsutil', 'resetclaimtimer'])
-        else:
-            # Other commands: /daily, /rolls, /dk
-            cmd = getSlashCommand(bot, [command_name])
-            if not cmd:
-                log(f"Warning: /{command_name} command not available")
-                return False
-
-        jsonResponse: List[Dict[str, Any]] = []
-        our_response: Optional[Dict[str, Any]] = None
-        r: Optional[requests.Response] = None
-        interaction_id: Optional[str] = None
-
-        if not cmd:
-            # Fallback for rollsutil resetclaimtimer: send $rt message instead
-            if command_name == 'rollsutil resetclaimtimer':
-                log(f"   Warning: Failed to get /rollsutil resetclaimtimer command, trying $rt message...")
-                trigger_result = bot.sendMessage(Vars.channelId, '$rt')
-                _record_interaction_context(token, '$rt', user_id, trigger_result)
-                if Latency.get_active_tier() == "legacy" and _sleep_interruptible(Vars.SLEEP_SHORT_SEC):
-                    return False
-                content_hint = "$rt"
-                r, jsonResponse, our_response = Fetch.wait_for_author_message(
-                    url,
-                    auth,
-                    botID,
-                    after_id=before_id,
-                    attempts=4,
-                    delay_sec=Vars.SLEEP_MED_SEC,
-                    latency_context="core_special_rt_message",
-                    content_contains=content_hint,
-                    stop_check=_should_stop
-                )
-                if r is not None:
-                    logRawResponse(f"GET - $rt message response", r)
-                    logSessionRawResponse(f"GET - $rt message response", r)
-                if jsonResponse:
-                    _note_last_seen_from_messages(jsonResponse)
-            else:
-                log(f"Error using /{command_name}: command not found")
-                return False
-        else:
-            trigger_result = bot.triggerSlashCommand(botID, Vars.channelId, Vars.serverId, data=cmd)
-            interaction_id = _record_interaction_context(token, interaction_name, user_id, trigger_result)
+        try:
+            tuCommand = getSlashCommand(bot, ['tu'])
+            if not tuCommand:
+                _set_last_fetch_reason("tu", token, "command_unavailable")
+                log("Warning: /tu command not available")
+                return None
+            _, pre_messages = Fetch.fetch_messages(url, auth, limit=1)
+            _note_last_seen_from_messages(pre_messages)
+            before_id = Fetch.get_latest_message_id(pre_messages)
+            trigger_result = bot.triggerSlashCommand(botID, Vars.channelId, Vars.serverId, data=tuCommand)
+            interaction_id = _record_interaction_context(token, 'tu', user_id, trigger_result)
             if Latency.get_active_tier() == "legacy" and _sleep_interruptible(Vars.SLEEP_SHORT_SEC):
-                return False
+                _set_last_fetch_reason("tu", token, "interrupted")
+                return None
 
-            r, jsonResponse, our_response = Fetch.wait_for_interaction_message(
+            r, jsonResponse, our_message = Fetch.wait_for_interaction_message(
                 url,
                 auth,
                 after_id=before_id,
                 user_id=user_id,
                 user_name=user_name if not user_id else None,
-                command_name=interaction_name,
+                command_name='tu',
                 interaction_id=interaction_id,
                 attempts=4,
                 delay_sec=Vars.SLEEP_MED_SEC,
-                latency_context=f"core_special_{interaction_name}",
+                latency_context="core_tu_status",
                 stop_check=_should_stop
             )
             if r is not None:
-                logRawResponse(f"GET - /{command_name} response", r)
-                logSessionRawResponse(f"GET - /{command_name} response", r)
+                logRawResponse("GET - /tu command response", r)
+                logSessionRawResponse("GET - /tu command response", r)
             if jsonResponse:
                 _note_last_seen_from_messages(jsonResponse)
 
-        if not our_response and jsonResponse:
-            candidates = _filter_messages_with_interaction(
+            if not jsonResponse:
+                _set_last_fetch_reason(
+                    "tu",
+                    token,
+                    "network_fail" if r is None or r.status_code != 200 else "no_fresh_tu",
+                )
+                return None
+
+            match_reason = "prefetched" if our_message else "none"
+            selected_message, selected_reason = _select_tu_response_message(
                 jsonResponse,
+                token=token,
                 user_id=user_id,
-                user_name=user_name if not user_id else None,
-                command_name=interaction_name,
+                user_name=user_name,
                 interaction_id=interaction_id,
-                require_interaction=True
             )
-            if candidates:
-                our_response = candidates[0]
+            if selected_message is not None:
+                our_message = selected_message
+                match_reason = selected_reason
 
-        if not our_response:
-            log(f"Warning: No response from our user for /{command_name}")
-            return False
-        _mark_last_seen(Vars.channelId, cast(Optional[str], our_response.get('id')))
+            if not our_message:
+                _set_last_fetch_reason("tu", token, "match_fail")
+                log("Warning: No response from our user in /tu (responses received but none matched our user ID)")
+                return None
+            if match_reason not in {"none", "exact_interaction_user"}:
+                log(f"Info: Matched /tu response via {match_reason}")
 
-        resolved_user_id = Fetch.extract_interaction_user_id(our_response)
-        resolved_user_name = Fetch.extract_interaction_user_name(our_response)
-        if resolved_user_id or resolved_user_name:
-            _set_user_identity_for_token(token, resolved_user_id or user_id, resolved_user_name)
-            if resolved_user_id:
-                user_id = resolved_user_id
+            _mark_last_seen(Vars.channelId, cast(Optional[str], our_message.get('id')))
 
-        response_content: str = cast(str, our_response.get('content', ''))
+            resolved_user_id = Fetch.extract_interaction_user_id(our_message)
+            resolved_user_name = Fetch.extract_interaction_user_name(our_message)
+            if resolved_user_id or resolved_user_name:
+                _set_user_identity_for_token(token, resolved_user_id or user_id, resolved_user_name)
+                if resolved_user_id:
+                    user_id = resolved_user_id
 
-        # Check for /rolls cooldown: "the roulette is limited to 14 uses per hour. **X** min left"
-        if command_name == 'rolls' and ('Upvote Mudae' in response_content or 'one vote per' in response_content):
-            log("/rolls requires an upvote to reset rolls (no reset applied)")
-            return False
-        if command_name == 'rolls' and 'the roulette is limited' in response_content:
-            cooldown_match = re.search(r'limited to \d+ uses per hour\. \*\*(\d+)\*\* min', response_content)
-            if cooldown_match:
-                cooldown_min = cooldown_match.group(1)
-                log(f"/rolls on cooldown: {cooldown_min} minutes remaining")
-                return False
+            message: str = cast(str, our_message.get('content', ''))
+            status = _parse_tu_message(message)
+            if not status:
+                _set_last_fetch_reason("tu", token, "no_fresh_tu")
+                return None
+            status['max_power'] = getMaxPowerForToken(token)
+            parsed_timestamp = _parse_discord_timestamp(cast(Optional[str], our_message.get('timestamp')))
+            if parsed_timestamp:
+                status['tu_timestamp'] = parsed_timestamp
 
-        if r is not None and r.status_code == 200:
-            log(f"Used /{command_name}")
-            return True
-        if r is not None:
-            log(f"Failed to use /{command_name}: {r.status_code}")
-        else:
-            log(f"Failed to use /{command_name}: no response")
-        return False
+            if not status.get('maintenance', False):
+                roll_sec, claim_sec = calculateFixedResetSeconds()
+                status['next_reset_sec'] = roll_sec
+                status['claim_reset_sec'] = claim_sec
+                status['next_reset_min'] = int(math.ceil(roll_sec / 60)) if roll_sec > 0 else 0
+                status['claim_reset_min'] = int(math.ceil(claim_sec / 60)) if claim_sec > 0 else 0
+
+            detailed_status = formatDetailedStatus(status)
+            log(f"📊 Status: {detailed_status}")
+            _dashboard_set_status(status)
+            render_dashboard()
+            _cache_tu_info(token, status)
+            _set_last_fetch_reason("tu", token, "sent")
+            _run_auto_give_from_tu(token=token, status=status, url=url, auth=auth)
+            return status
+        finally:
+            if lease is not None:
+                lease.release()
     except Exception as e:
+        _set_last_fetch_reason("tu", token, "network_fail")
+        log(f"❌ Error getting /tu info: {e}")
+        return None
+
+def useSpecialCommand(token: str, command_name: str) -> bool:
+    """Use a special command (/daily, /rolls, /dk, /rollsutil resetclaimtimer)."""
+    _set_last_fetch_reason("special", token, None)
+    try:
+        bot, auth = getClientAndAuth(token)
+        url = getUrl()
+        resolved_id, resolved_name = _ensure_user_identity(token)
+        user_id = resolved_id
+        user_name = resolved_name
+        interaction_name = command_name.split()[0]
+        allowed_names = _build_account_identity_names(token, user_name)
+        lease, gate_allowed = _acquire_same_account_action_gate(token, user_id, user_name)
+        if not gate_allowed:
+            _set_last_fetch_reason("special", token, "busy_skip")
+            log_info(f"Skipping /{command_name} because the same-account action gate is busy")
+            return False
+
+        try:
+            _, pre_messages = Fetch.fetch_messages(url, auth, limit=1)
+            _note_last_seen_from_messages(pre_messages)
+            before_id = Fetch.get_latest_message_id(pre_messages)
+
+            if command_name == 'rollsutil resetclaimtimer':
+                cmd = getSlashCommand(bot, ['rollsutil', 'resetclaimtimer'])
+            else:
+                cmd = getSlashCommand(bot, [command_name])
+                if not cmd:
+                    _set_last_fetch_reason("special", token, "command_unavailable")
+                    log(f"Warning: /{command_name} command not available")
+                    return False
+
+            jsonResponse: List[Dict[str, Any]] = []
+            our_response: Optional[Dict[str, Any]] = None
+            r: Optional[requests.Response] = None
+            interaction_id: Optional[str] = None
+
+            if not cmd:
+                if command_name == 'rollsutil resetclaimtimer':
+                    log(f"   Warning: Failed to get /rollsutil resetclaimtimer command, trying $rt message...")
+                    trigger_result = bot.sendMessage(Vars.channelId, '$rt')
+                    _record_interaction_context(token, '$rt', user_id, trigger_result)
+                    if Latency.get_active_tier() == "legacy" and _sleep_interruptible(Vars.SLEEP_SHORT_SEC):
+                        _set_last_fetch_reason("special", token, "interrupted")
+                        return False
+                    r, jsonResponse, our_response = Fetch.wait_for_author_message(
+                        url,
+                        auth,
+                        botID,
+                        after_id=before_id,
+                        attempts=4,
+                        delay_sec=Vars.SLEEP_MED_SEC,
+                        latency_context="core_special_rt_message",
+                        content_contains="$rt",
+                        stop_check=_should_stop
+                    )
+                    if r is not None:
+                        logRawResponse("GET - $rt message response", r)
+                        logSessionRawResponse("GET - $rt message response", r)
+                    if jsonResponse:
+                        _note_last_seen_from_messages(jsonResponse)
+                else:
+                    _set_last_fetch_reason("special", token, "command_unavailable")
+                    log(f"Error using /{command_name}: command not found")
+                    return False
+            else:
+                trigger_result = bot.triggerSlashCommand(botID, Vars.channelId, Vars.serverId, data=cmd)
+                interaction_id = _record_interaction_context(token, interaction_name, user_id, trigger_result)
+                if Latency.get_active_tier() == "legacy" and _sleep_interruptible(Vars.SLEEP_SHORT_SEC):
+                    _set_last_fetch_reason("special", token, "interrupted")
+                    return False
+
+                r, jsonResponse, our_response = Fetch.wait_for_interaction_message(
+                    url,
+                    auth,
+                    after_id=before_id,
+                    user_id=user_id,
+                    user_name=user_name if not user_id else None,
+                    command_name=interaction_name,
+                    interaction_id=interaction_id,
+                    attempts=4,
+                    delay_sec=Vars.SLEEP_MED_SEC,
+                    latency_context=f"core_special_{interaction_name}",
+                    stop_check=_should_stop
+                )
+                if r is not None:
+                    logRawResponse(f"GET - /{command_name} response", r)
+                    logSessionRawResponse(f"GET - /{command_name} response", r)
+                if jsonResponse:
+                    _note_last_seen_from_messages(jsonResponse)
+
+            if cmd:
+                match_reason = "prefetched" if our_response else "none"
+                if our_response is None:
+                    our_response, match_reason = _select_interaction_response_message(
+                        jsonResponse,
+                        token=token,
+                        command_name=interaction_name,
+                        user_id=user_id,
+                        user_name=user_name,
+                        interaction_id=interaction_id,
+                    )
+                if our_response and match_reason not in {"none", "exact_interaction_user"}:
+                    log(f"Info: Matched /{command_name} response via {match_reason}")
+            elif not our_response and allowed_names:
+                named_candidates = [
+                    msg for msg in jsonResponse
+                    if isinstance(msg, dict) and _message_matches_identity_names(msg, allowed_names)
+                ]
+                if len(named_candidates) == 1:
+                    our_response = named_candidates[0]
+
+            if not our_response:
+                _set_last_fetch_reason("special", token, "match_fail")
+                log(f"Warning: No response from our user for /{command_name}")
+                return False
+            _mark_last_seen(Vars.channelId, cast(Optional[str], our_response.get('id')))
+
+            resolved_user_id = Fetch.extract_interaction_user_id(our_response)
+            resolved_user_name = Fetch.extract_interaction_user_name(our_response)
+            if resolved_user_id or resolved_user_name:
+                _set_user_identity_for_token(token, resolved_user_id or user_id, resolved_user_name)
+                if resolved_user_id:
+                    user_id = resolved_user_id
+
+            response_content: str = cast(str, our_response.get('content', ''))
+            if command_name == 'rolls' and ('Upvote Mudae' in response_content or 'one vote per' in response_content):
+                _set_last_fetch_reason("special", token, "sent")
+                log("/rolls requires an upvote to reset rolls (no reset applied)")
+                return False
+            if command_name == 'rolls' and 'the roulette is limited' in response_content:
+                cooldown_match = re.search(r'limited to \d+ uses per hour\. \*\*(\d+)\*\* min', response_content)
+                if cooldown_match:
+                    cooldown_min = cooldown_match.group(1)
+                    _set_last_fetch_reason("special", token, "sent")
+                    log(f"/rolls on cooldown: {cooldown_min} minutes remaining")
+                    return False
+
+            if r is not None and r.status_code == 200:
+                _set_last_fetch_reason("special", token, "sent")
+                log(f"Used /{command_name}")
+                return True
+            if r is not None:
+                _set_last_fetch_reason("special", token, "network_fail")
+                log(f"Failed to use /{command_name}: {r.status_code}")
+            else:
+                _set_last_fetch_reason("special", token, "network_fail")
+                log(f"Failed to use /{command_name}: no response")
+            return False
+        finally:
+            if lease is not None:
+                lease.release()
+    except Exception as e:
+        _set_last_fetch_reason("special", token, "network_fail")
         log(f"Error using /{command_name}: {e}")
         return False
 
@@ -3801,80 +3864,99 @@ def isSessionEligible(tu_info: Dict[str, Any]) -> bool:
     return eligible
 
 def sendReport(token: str) -> Optional[list]:  # type: ignore[type-arg]
-    """Send /report to get character claim and kakera updates"""
+    """Send /report to get character claim and kakera updates."""
+    _set_last_fetch_reason("report", token, None)
     try:
         bot, auth = getClientAndAuth(token)
         url = getUrl()
         resolved_id, resolved_name = _ensure_user_identity(token)
         user_id = resolved_id
         user_name = resolved_name
-        interaction_id: Optional[str] = None
+        lease, gate_allowed = _acquire_same_account_action_gate(token, user_id, user_name)
+        if not gate_allowed:
+            _set_last_fetch_reason("report", token, "busy_skip")
+            log_info("Skipping /report because the same-account action gate is busy")
+            return None
 
         try:
-            reportCommand = getSlashCommand(bot, ['report'])
-            if not reportCommand:
+            interaction_id: Optional[str] = None
+
+            try:
+                reportCommand = getSlashCommand(bot, ['report'])
+                if not reportCommand:
+                    _set_last_fetch_reason("report", token, "command_unavailable")
+                    log("Warning: /report command not available")
+                    return None
+                _, pre_messages = Fetch.fetch_messages(url, auth, limit=1)
+                _note_last_seen_from_messages(pre_messages)
+                before_id = Fetch.get_latest_message_id(pre_messages)
+                trigger_result = bot.triggerSlashCommand(botID, Vars.channelId, Vars.serverId, data=reportCommand)
+                interaction_id = _record_interaction_context(token, 'report', user_id, trigger_result)
+                if Latency.get_active_tier() == "legacy" and _sleep_interruptible(Vars.SLEEP_LONG_SEC):
+                    _set_last_fetch_reason("report", token, "interrupted")
+                    return None
+            except Exception:
+                _set_last_fetch_reason("report", token, "command_unavailable")
                 log("Warning: /report command not available")
                 return None
-            _, pre_messages = Fetch.fetch_messages(url, auth, limit=1)
-            _note_last_seen_from_messages(pre_messages)
-            before_id = Fetch.get_latest_message_id(pre_messages)
-            trigger_result = bot.triggerSlashCommand(botID, Vars.channelId, Vars.serverId, data=reportCommand)
-            interaction_id = _record_interaction_context(token, 'report', user_id, trigger_result)
-            if Latency.get_active_tier() == "legacy" and _sleep_interruptible(Vars.SLEEP_LONG_SEC):
-                return None
-        except Exception:
-            log("Warning: /report command not available")
-            return None
 
-        r, jsonResponse, our_response = Fetch.wait_for_interaction_message(
-            url,
-            auth,
-            after_id=before_id,
-            user_id=user_id,
-            user_name=user_name if not user_id else None,
-            command_name='report',
-            interaction_id=interaction_id,
-            attempts=4,
-            delay_sec=Vars.SLEEP_LONG_SEC,
-            latency_context="core_report"
-        )
-        if r is not None:
-            logRawResponse("GET - /report response", r)
-            logSessionRawResponse("GET - /report response", r)
-        if jsonResponse:
-            _note_last_seen_from_messages(jsonResponse)
-
-        if not jsonResponse:
-            return None
-
-        if not our_response:
-            candidates = _filter_messages_with_interaction(
-                jsonResponse,
+            r, jsonResponse, our_response = Fetch.wait_for_interaction_message(
+                url,
+                auth,
+                after_id=before_id,
                 user_id=user_id,
                 user_name=user_name if not user_id else None,
                 command_name='report',
                 interaction_id=interaction_id,
-                require_interaction=True
+                attempts=4,
+                delay_sec=Vars.SLEEP_LONG_SEC,
+                latency_context="core_report"
             )
-            if candidates:
-                our_response = candidates[0]
+            if r is not None:
+                logRawResponse("GET - /report response", r)
+                logSessionRawResponse("GET - /report response", r)
+            if jsonResponse:
+                _note_last_seen_from_messages(jsonResponse)
 
-        if not our_response:
-            log("Warning: No response from our user for /report")
-            return None
-        _mark_last_seen(Vars.channelId, cast(Optional[str], our_response.get('id')))
+            if not jsonResponse:
+                _set_last_fetch_reason(
+                    "report",
+                    token,
+                    "network_fail" if r is None or r.status_code != 200 else "no_response",
+                )
+                return None
 
-        resolved_user_id = Fetch.extract_interaction_user_id(our_response)
-        resolved_user_name = Fetch.extract_interaction_user_name(our_response)
-        if resolved_user_id or resolved_user_name:
-            _set_user_identity_for_token(token, resolved_user_id or user_id, resolved_user_name)
-            if resolved_user_id:
-                user_id = resolved_user_id
-            if resolved_user_name:
-                user_name = resolved_user_name
+            match_reason = "prefetched" if our_response else "none"
+            if not our_response:
+                our_response, match_reason = _select_interaction_response_message(
+                    jsonResponse,
+                    token=token,
+                    command_name='report',
+                    user_id=user_id,
+                    user_name=user_name,
+                    interaction_id=interaction_id,
+                )
 
-        return jsonResponse
+            if not our_response:
+                _set_last_fetch_reason("report", token, "match_fail")
+                log("Warning: No response from our user for /report")
+                return None
+            if match_reason not in {"none", "exact_interaction_user"}:
+                log(f"Info: Matched /report response via {match_reason}")
+            _mark_last_seen(Vars.channelId, cast(Optional[str], our_response.get('id')))
+
+            resolved_user_id = Fetch.extract_interaction_user_id(our_response)
+            resolved_user_name = Fetch.extract_interaction_user_name(our_response)
+            if resolved_user_id or resolved_user_name:
+                _set_user_identity_for_token(token, resolved_user_id or user_id, resolved_user_name)
+
+            _set_last_fetch_reason("report", token, "sent")
+            return jsonResponse
+        finally:
+            if lease is not None:
+                lease.release()
     except Exception as e:
+        _set_last_fetch_reason("report", token, "network_fail")
         log(f"Error sending /report: {e}")
         return None
 
@@ -4340,173 +4422,214 @@ def fetchAndParseMudaeWishlist(token: str) -> Dict[str, Any]:
     """
     Fetch Mudae's wishlist via /wl command and parse it.
     Returns organized wishlist with star wishes (⭐) and regular wishes prioritized.
-    
-    Priority order:
-    1. ⭐ Star wishes (highest priority)
-    2. Regular wishes with no emoji (same priority as Vars.py)
-    3. Skipped: ✅ (already claimed) and ❌ (failed wishes)
     """
+    _set_last_fetch_reason("wl", token, None)
+    cached_wishlist = _get_cached_wishlist(token, _wishlist_cache_ttl_sec())
+    if cached_wishlist:
+        _set_last_fetch_reason("wl", token, "cache_hit")
+        log_info("📋 Reusing fresh cached wishlist")
+        _dashboard_set_wishlist(cached_wishlist)
+        render_dashboard()
+        return cached_wishlist
+
     try:
         bot, auth = getClientAndAuth(token)
         url = getUrl()
         resolved_id, resolved_name = _ensure_user_identity(token)
         user_id = resolved_id
         user_name = resolved_name
-        fallback_names: List[str] = []
-        if user_name:
-            fallback_names.append(user_name)
-        token_name = getUserNameForToken(token)
-        if token_name and token_name.lower() not in {n.lower() for n in fallback_names}:
-            fallback_names.append(token_name)
-        if current_user_name and current_user_name.lower() not in {n.lower() for n in fallback_names}:
-            fallback_names.append(current_user_name)
-        
-        log("📋 Fetching Mudae's wishlist via /wl...")
-        
-        cmd = getSlashCommand(bot, ['wl'])
-        if not cmd:
-            log("Warning: /wl command not available")
-            return {'status': 'error', 'error': 'wl command not found'}
-        _, pre_messages = Fetch.fetch_messages(url, auth, limit=1)
-        _note_last_seen_from_messages(pre_messages)
-        before_id = Fetch.get_latest_message_id(pre_messages)
-        trigger_result = bot.triggerSlashCommand(botID, Vars.channelId, Vars.serverId, data=cmd)
-        interaction_id = _record_interaction_context(token, 'wl', user_id, trigger_result)
-        if Latency.get_active_tier() == "legacy" and _sleep_interruptible(Vars.SLEEP_LONG_SEC):
-            return {'status': 'error', 'error': 'interrupted'}
-        
-        # Get the response
-        r, wishlist_resp, our_message = Fetch.wait_for_interaction_message(
-            url,
-            auth,
-            after_id=before_id,
-            user_id=user_id,
-            user_name=user_name if not user_id else None,
-            command_name='wl',
-            interaction_id=interaction_id,
-            attempts=4,
-            delay_sec=Vars.SLEEP_LONG_SEC,
-            latency_context="core_wishlist"
-        )
-        if r is not None:
-            logRawResponse("GET - /wl response", r)
-            logSessionRawResponse("GET - /wl response", r)
-        if wishlist_resp:
-            _note_last_seen_from_messages(wishlist_resp)
-        
-        if our_message:
-            _mark_last_seen(Vars.channelId, cast(Optional[str], our_message.get('id')))
-            resolved_user_id = Fetch.extract_interaction_user_id(our_message)
-            resolved_user_name = Fetch.extract_interaction_user_name(our_message)
+        allowed_names = _build_account_identity_names(token, user_name)
+        lease, gate_allowed = _acquire_same_account_action_gate(token, user_id, user_name)
+        if not gate_allowed:
+            _set_last_fetch_reason("wl", token, "busy_skip")
+            log_info("📋 Skipping /wl because the same-account action gate is busy and no fresh cache is available")
+            return {'status': 'error', 'error': 'same_account_action_busy'}
+
+        try:
+            log("📋 Fetching Mudae's wishlist via /wl...")
+
+            cmd = getSlashCommand(bot, ['wl'])
+            if not cmd:
+                _set_last_fetch_reason("wl", token, "command_unavailable")
+                log("Warning: /wl command not available")
+                return {'status': 'error', 'error': 'wl command not found'}
+            _, pre_messages = Fetch.fetch_messages(url, auth, limit=1)
+            _note_last_seen_from_messages(pre_messages)
+            before_id = Fetch.get_latest_message_id(pre_messages)
+            trigger_result = bot.triggerSlashCommand(botID, Vars.channelId, Vars.serverId, data=cmd)
+            interaction_id = _record_interaction_context(token, 'wl', user_id, trigger_result)
+            if Latency.get_active_tier() == "legacy" and _sleep_interruptible(Vars.SLEEP_LONG_SEC):
+                _set_last_fetch_reason("wl", token, "interrupted")
+                return {'status': 'error', 'error': 'interrupted'}
+
+            r, wishlist_resp, our_message = Fetch.wait_for_interaction_message(
+                url,
+                auth,
+                after_id=before_id,
+                user_id=user_id,
+                user_name=user_name if not user_id else None,
+                command_name='wl',
+                interaction_id=interaction_id,
+                attempts=4,
+                delay_sec=Vars.SLEEP_LONG_SEC,
+                latency_context="core_wishlist"
+            )
+            if r is not None:
+                logRawResponse("GET - /wl response", r)
+                logSessionRawResponse("GET - /wl response", r)
+            if wishlist_resp:
+                _note_last_seen_from_messages(wishlist_resp)
+
+            if not wishlist_resp:
+                _set_last_fetch_reason(
+                    "wl",
+                    token,
+                    "network_fail" if r is None or r.status_code != 200 else "no_response",
+                )
+                status = r.status_code if r is not None else 'no response'
+                log(f"Failed to fetch wishlist: {status}")
+                return {'status': 'error', 'code': status}
+
+            match_reason = "prefetched" if our_message else "none"
+            selected_message = our_message
+            if selected_message is None:
+                selected_message, match_reason = _select_interaction_response_message(
+                    wishlist_resp,
+                    token=token,
+                    command_name='wl',
+                    user_id=user_id,
+                    user_name=user_name,
+                    interaction_id=interaction_id,
+                )
+            if not selected_message:
+                _set_last_fetch_reason("wl", token, "match_fail")
+                log("Warning: No response from our user for /wl")
+                return {'status': 'error', 'error': 'match_fail'}
+            if match_reason not in {"none", "exact_interaction_user"}:
+                log(f"Info: Matched /wl response via {match_reason}")
+
+            _mark_last_seen(Vars.channelId, cast(Optional[str], selected_message.get('id')))
+            resolved_user_id = Fetch.extract_interaction_user_id(selected_message)
+            resolved_user_name = Fetch.extract_interaction_user_name(selected_message)
             if resolved_user_id or resolved_user_name:
                 _set_user_identity_for_token(token, resolved_user_id or user_id, resolved_user_name)
                 if resolved_user_id:
                     user_id = resolved_user_id
                 if resolved_user_name:
                     user_name = resolved_user_name
-        
-        
-        if r is not None and r.status_code == 200:
-            
-            # Parse the wishlist from embeds
-            star_wishes = []
-            regular_wishes = []
-            
-            if wishlist_resp and len(wishlist_resp) > 0:
-                # Search through all messages to find one with embeds
-                wishlist_embed = None
-                candidates = _filter_messages_with_interaction(
-                    wishlist_resp,
-                    user_id=user_id,
-                    user_name=user_name if not user_id else None,
-                    command_name='wl',
-                    interaction_id=interaction_id,
-                    require_interaction=True
-                )
-                search_messages = candidates if candidates else wishlist_resp
-                fallback_embed = None
-                for msg in search_messages:
-                    if isinstance(msg, dict) and 'embeds' in msg and len(msg.get('embeds', [])) > 0:
-                        # Check if this embed contains wishlist data (has 'author' with name containing "Wishlist")
-                        embed = msg['embeds'][0]
-                        author_name = embed.get('author', {}).get('name', '')
-                        matches_name = False
-                        if fallback_names and author_name:
-                            author_lower = author_name.lower()
-                            matches_name = any(name.lower() in author_lower for name in fallback_names)
-                        if 'Wishlist' in author_name or '$wl' in author_name or '$sw' in author_name:
-                            if matches_name:
-                                wishlist_embed = embed
-                                break
-                            if fallback_embed is None:
-                                fallback_embed = embed
-                
-                if not wishlist_embed and fallback_embed:
-                    wishlist_embed = fallback_embed
+                    allowed_names = _build_account_identity_names(token, user_name)
 
-                if wishlist_embed:
-                    description = wishlist_embed.get('description', '')
-                    author_name = wishlist_embed.get('author', {}).get('name', '')
+            if r is None or r.status_code != 200:
+                _set_last_fetch_reason("wl", token, "network_fail")
+                status = r.status_code if r is not None else 'no response'
+                log(f"Failed to fetch wishlist: {status}")
+                return {'status': 'error', 'code': status}
 
-                    wl_used = None
-                    wl_total = None
-                    sw_used = None
-                    sw_total = None
-                    wl_match = re.search(r'(\d+)\s*/\s*(\d+)\s*\$wl', author_name)
-                    sw_match = re.search(r'(\d+)\s*/\s*(\d+)\s*\$sw', author_name)
-                    if wl_match:
-                        wl_used = int(wl_match.group(1))
-                        wl_total = int(wl_match.group(2))
-                    if sw_match:
-                        sw_used = int(sw_match.group(1))
-                        sw_total = int(sw_match.group(2))
-                    
-                    log(f"\u2139\ufe0f  {author_name}")
-                    
-                    # Parse character list from description
-                    lines = description.split('\n')
-                    for line in lines:
-                        line = line.strip()
-                        if not line:
+            candidates = _filter_messages_with_interaction(
+                wishlist_resp,
+                user_id=user_id,
+                user_name=user_name if not user_id else None,
+                command_name='wl',
+                interaction_id=interaction_id,
+                require_interaction=True,
+            )
+            if not candidates and selected_message:
+                candidates = [selected_message]
+            if allowed_names:
+                named_candidates = [
+                    msg
+                    for msg in candidates
+                    if isinstance(msg, dict) and _message_matches_identity_names(msg, allowed_names)
+                ]
+                if named_candidates:
+                    candidates = named_candidates
+
+            star_wishes: List[str] = []
+            regular_wishes: List[str] = []
+            wishlist_embed = None
+            for msg in candidates:
+                if not isinstance(msg, dict):
+                    continue
+                embeds = msg.get('embeds', [])
+                if not isinstance(embeds, list) or not embeds:
+                    continue
+                embed = embeds[0]
+                if not isinstance(embed, dict):
+                    continue
+                author_name = embed.get('author', {}).get('name', '')
+                if 'Wishlist' in author_name or '$wl' in author_name or '$sw' in author_name:
+                    if allowed_names and author_name:
+                        author_lower = author_name.lower()
+                        if not any(name.lower() in author_lower for name in allowed_names):
                             continue
+                    wishlist_embed = embed
+                    break
 
-                        char_name, has_star, is_claimed, is_failed = _parse_wishlist_line(line)
-                        if not char_name:
-                            continue
-                        # Claimed/failed entries are not claimable and must be excluded.
-                        if is_claimed or is_failed:
-                            continue
-                        if has_star:
-                            star_wishes.append(char_name)
-                        else:
-                            regular_wishes.append(char_name)
+            if wishlist_embed:
+                description = wishlist_embed.get('description', '')
+                author_name = wishlist_embed.get('author', {}).get('name', '')
 
-                    log(f"Wishlist parse: {len(star_wishes)} active star, {len(regular_wishes)} active regular")
-                    
-                    wishlist_data = {
-                        'status': 'success',
-                        'star_wishes': star_wishes,
-                        'regular_wishes': regular_wishes,
-                        'all_wishes': star_wishes + regular_wishes,
-                        'wl_used': wl_used,
-                        'wl_total': wl_total,
-                        'sw_used': sw_used,
-                        'sw_total': sw_total
-                    }
-                    _dashboard_set_wishlist(wishlist_data)
-                    render_dashboard()
-                    return wishlist_data
-            
+                wl_used = None
+                wl_total = None
+                sw_used = None
+                sw_total = None
+                wl_match = re.search(r'(\d+)\s*/\s*(\d+)\s*\$wl', author_name)
+                sw_match = re.search(r'(\d+)\s*/\s*(\d+)\s*\$sw', author_name)
+                if wl_match:
+                    wl_used = int(wl_match.group(1))
+                    wl_total = int(wl_match.group(2))
+                if sw_match:
+                    sw_used = int(sw_match.group(1))
+                    sw_total = int(sw_match.group(2))
+
+                log(f"\u2139\ufe0f  {author_name}")
+
+                lines = description.split('\n')
+                for line in lines:
+                    line = line.strip()
+                    if not line:
+                        continue
+
+                    char_name, has_star, is_claimed, is_failed = _parse_wishlist_line(line)
+                    if not char_name:
+                        continue
+                    if is_claimed or is_failed:
+                        continue
+                    if has_star:
+                        star_wishes.append(char_name)
+                    else:
+                        regular_wishes.append(char_name)
+
+                log(f"Wishlist parse: {len(star_wishes)} active star, {len(regular_wishes)} active regular")
+
+                wishlist_data = {
+                    'status': 'success',
+                    'star_wishes': star_wishes,
+                    'regular_wishes': regular_wishes,
+                    'all_wishes': star_wishes + regular_wishes,
+                    'wl_used': wl_used,
+                    'wl_total': wl_total,
+                    'sw_used': sw_used,
+                    'sw_total': sw_total
+                }
+                _cache_wishlist(token, wishlist_data)
+                _set_last_fetch_reason("wl", token, "sent")
+                _dashboard_set_wishlist(wishlist_data)
+                render_dashboard()
+                return wishlist_data
+
             log("⚠️  No wishlist data found in response")
             empty_wishlist = {'status': 'success', 'star_wishes': [], 'regular_wishes': [], 'all_wishes': []}
+            _cache_wishlist(token, empty_wishlist)
+            _set_last_fetch_reason("wl", token, "sent")
             _dashboard_set_wishlist(empty_wishlist)
             render_dashboard()
             return empty_wishlist
-        else:
-            status = r.status_code if r is not None else 'no response'
-            log(f"Failed to fetch wishlist: {status}")
-            return {'status': 'error', 'code': status}
+        finally:
+            if lease is not None:
+                lease.release()
     except Exception as e:
+        _set_last_fetch_reason("wl", token, "network_fail")
         log(f"❌ Error fetching wishlist: {e}")
         return {'status': 'error', 'error': str(e)}
 
@@ -4633,6 +4756,29 @@ def _build_roll_coordination_scope(
         user_id=user_id,
         user_name=user_name,
     )
+
+
+def _acquire_same_account_action_gate(
+    token: str,
+    user_id: Optional[str],
+    user_name: Optional[str],
+    *,
+    wait_timeout_sec: float = 0.0,
+) -> Tuple[Optional[Any], bool]:
+    if not bool(getattr(Vars, "ROLL_COORDINATION_ENABLED", True)):
+        return None, True
+    scope, owner_label = _build_roll_coordination_scope(token, user_id, user_name)
+    ttl_sec = max(5.0, float(getattr(Vars, "ROLL_LEASE_TTL_SEC", 90.0) or 90.0))
+    heartbeat_sec = max(1.0, float(getattr(Vars, "ROLL_LEASE_HEARTBEAT_SEC", 10.0) or 10.0))
+    lease = acquire_lease(
+        scope,
+        owner_label,
+        ttl_sec=ttl_sec,
+        heartbeat_sec=heartbeat_sec,
+        wait_timeout_sec=max(0.0, float(wait_timeout_sec)),
+        cancel_check=_should_stop,
+    )
+    return (lease, bool(lease.acquired))
 
 
 def _message_indicates_roll_exhausted(content: str) -> bool:
@@ -5267,51 +5413,21 @@ def _run_enhanced_roll_session(
 
 
 def enhancedRoll(token: str, initial_tu_info: Optional[Dict[str, Any]] = None) -> Optional[Dict[str, Any]]:
-    """Enhanced rolling system with command management and eligibility checks"""
+    """Enhanced rolling system with command management and eligibility checks."""
     bot, auth = getClientAndAuth(token)
     url = getUrl()
     resolved_id, resolved_name = _ensure_user_identity(token)
     user_id = resolved_id
     user_name = resolved_name
-    
+
     session_start = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())
     _dashboard_reset_roll_state(session_start)
     log(f"🎲 Enhanced Roll Session starting at {session_start}")
     render_dashboard()
     if _should_stop():
         return None
-    
-    # Step 1: Get initial status
+
     cached_tu = initial_tu_info if initial_tu_info is not None else initial_tu_cache.pop(token, None)
-    if cached_tu:
-        tu_info = cached_tu
-        detailed_status = formatDetailedStatus(tu_info)
-        log(f"📊 Status (cached): {detailed_status}")
-        _dashboard_set_status(tu_info)
-        render_dashboard()
-        _cache_tu_info(token, tu_info)
-    else:
-        tu_info = getTuInfo(token)
-    if not tu_info:
-        log("❌ Failed to get /tu info")
-        render_dashboard()
-        return None
-
-    # Step 1A: Fetch and parse Mudae's wishlist
-    log("📋 Step 1A: Fetching Mudae's wishlist...")
-    mudae_wishlist = fetchAndParseMudaeWishlist(token)
-    
-    if mudae_wishlist['status'] != 'success':
-        log("⚠️  Could not fetch Mudae wishlist, continuing with Vars.py wishlist only")
-        mudae_star_wishes = []
-        mudae_regular_wishes = []
-    else:
-        mudae_star_wishes = mudae_wishlist.get('star_wishes', [])
-        mudae_regular_wishes = mudae_wishlist.get('regular_wishes', [])
-    
-    if Latency.get_active_tier() == "legacy" and _sleep_interruptible(Vars.SLEEP_LONG_SEC):
-        return None
-
     coordination_enabled = bool(getattr(Vars, "ROLL_COORDINATION_ENABLED", True))
     lease = None
     try:
@@ -5330,11 +5446,45 @@ def enhancedRoll(token: str, initial_tu_info: Optional[Dict[str, Any]] = None) -
                 cancel_check=_should_stop,
             )
             if not lease.acquired:
-                log_warn("Another instance still owns the roll lease; skipping this cycle")
-                refreshed_after_wait, refreshed_ok = _refresh_roll_status(token, "lease timeout fallback")
-                return refreshed_after_wait if refreshed_ok and refreshed_after_wait else tu_info
+                busy_cached = cached_tu or _get_cached_tu_info(token, _tu_reuse_max_age_sec())
+                if busy_cached:
+                    _set_last_fetch_reason("tu", token, "cache_hit")
+                    log_warn("Another instance still owns the roll lease; reusing fresh cached /tu state for this cycle")
+                    return busy_cached
+                _set_last_fetch_reason("tu", token, "same_account_action_busy")
+                log_warn("Another instance still owns the roll lease; skipping this cycle without sending fallback commands")
+                return None
             if lease.waited_sec >= 0.25:
                 log_info(f"Roll coordination lease acquired after {lease.waited_sec:.1f}s")
+
+        if cached_tu:
+            tu_info = cached_tu
+            detailed_status = formatDetailedStatus(tu_info)
+            log(f"📊 Status (cached): {detailed_status}")
+            _dashboard_set_status(tu_info)
+            render_dashboard()
+            _cache_tu_info(token, tu_info)
+        else:
+            tu_info = getTuInfo(token)
+        if not tu_info:
+            log("❌ Failed to get /tu info")
+            render_dashboard()
+            return None
+
+        log("📋 Step 1A: Fetching Mudae's wishlist...")
+        mudae_wishlist = fetchAndParseMudaeWishlist(token)
+
+        if mudae_wishlist['status'] != 'success':
+            log("⚠️  Could not fetch Mudae wishlist, continuing with Vars.py wishlist only")
+            mudae_star_wishes = []
+            mudae_regular_wishes = []
+        else:
+            mudae_star_wishes = mudae_wishlist.get('star_wishes', [])
+            mudae_regular_wishes = mudae_wishlist.get('regular_wishes', [])
+
+        if Latency.get_active_tier() == "legacy" and _sleep_interruptible(Vars.SLEEP_LONG_SEC):
+            return None
+
         return _run_enhanced_roll_session(
             token=token,
             bot=bot,

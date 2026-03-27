@@ -2,6 +2,7 @@
 import time
 import threading
 import math
+import random
 import os
 import ctypes
 import importlib
@@ -11,6 +12,7 @@ from mudae.paths import LOGS_DIR, ensure_runtime_dirs
 from mudae.core.session_engine import (
     initializeSession,
     enhancedRoll,
+    getLastTuFetchReason,
     log,
     log_info,
     log_success,
@@ -243,7 +245,16 @@ def main():
 
     def _no_reset_retry_delay_seconds(failures: int) -> int:
         attempts = max(1, int(failures))
-        return min(300, 30 * (2 ** (attempts - 1)))
+        base_delay = min(300, 30 * (2 ** (attempts - 1)))
+        try:
+            jitter_pct = float(getattr(Vars, "NO_RESET_RETRY_JITTER_PCT", 0.15) or 0.15)
+        except (TypeError, ValueError):
+            jitter_pct = 0.15
+        jitter_pct = max(0.0, min(0.15, jitter_pct))
+        if base_delay <= 0 or jitter_pct <= 0:
+            return base_delay
+        jittered = int(round(base_delay * (1.0 + random.uniform(0.0, jitter_pct))))
+        return min(300, max(1, jittered))
 
     def _scan_interval_bounds(remaining_sec: int) -> tuple[float, float]:
         if remaining_sec >= 60 * 30:
@@ -559,14 +570,29 @@ def main():
                 else:
                     tu_retry_failures += 1
                     wait_seconds = _no_reset_retry_delay_seconds(tu_retry_failures)
-                    log_warn(
-                        f"No reset time available after /tu fetch, waiting {wait_seconds} seconds before retry "
-                        f"(attempt {tu_retry_failures}, capped at 300 seconds)..."
-                    )
+                    tu_reason = getLastTuFetchReason(current_token)
+                    if tu_reason == "same_account_action_busy":
+                        retry_label = "Same-account action gate busy"
+                        log_warn(
+                            f"Same-account action gate busy, waiting {wait_seconds} seconds before retry without "
+                            f"sending extra commands (attempt {tu_retry_failures}, capped at 300 seconds)..."
+                        )
+                    elif tu_reason == "network_fail":
+                        retry_label = "Network error while refreshing /tu"
+                        log_warn(
+                            f"Network error while refreshing /tu, waiting {wait_seconds} seconds before retry "
+                            f"(attempt {tu_retry_failures}, capped at 300 seconds)..."
+                        )
+                    else:
+                        retry_label = "No fresh /tu state available"
+                        log_warn(
+                            f"No fresh /tu state available, waiting {wait_seconds} seconds before retry "
+                            f"(attempt {tu_retry_failures}, capped at 300 seconds)..."
+                        )
                     next_action_time = _format_next_action_time(wait_seconds)
                     setDashboardState(
                         "WAITING",
-                        last_action="No reset time available after /tu fetch",
+                        last_action=retry_label,
                         next_action=f"Retry at {next_action_time}"
                     )
                     setConnectionStatus("Connected")

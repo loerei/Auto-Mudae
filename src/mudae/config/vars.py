@@ -356,6 +356,9 @@ ROLL_LEASE_HEARTBEAT_SEC = 10.0
 ROLL_LEASE_WAIT_SEC = 120.0
 ROLL_STALL_REFRESH_THRESHOLD = 2
 ROLL_STALL_ABORT_THRESHOLD = 4
+TU_INFO_REUSE_MAX_AGE_SEC = 90.0
+WISHLIST_CACHE_TTL_SEC = 300.0
+NO_RESET_RETRY_JITTER_PCT = 0.15
 
 # Latency optimization profile
 # - aggressive_auto: aggressive timings with automatic degrade/recover
