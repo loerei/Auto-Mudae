@@ -1,13 +1,16 @@
 from __future__ import annotations
 
 import asyncio
+import os
+import subprocess
+import sys
 from contextlib import asynccontextmanager
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 import uvicorn
-from fastapi import FastAPI, HTTPException, Query, WebSocket, WebSocketDisconnect
+from fastapi import BackgroundTasks, FastAPI, HTTPException, Query, WebSocket, WebSocketDisconnect
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
@@ -73,6 +76,13 @@ db = WebDB(WEB_DB_PATH)
 supervisor = WebSupervisor(db)
 PROJECT_ROOT = Path(__file__).resolve().parents[3]
 DIST_DIR = PROJECT_ROOT / "webui" / "dist"
+SPA_HTML_HEADERS = {
+    "Cache-Control": "no-store, no-cache, must-revalidate",
+    "Pragma": "no-cache",
+    "Expires": "0",
+}
+_CLOSE_PARENT_CONSOLE_ENV = "MUDAE_WEBUI_CLOSE_PARENT_CONSOLE"
+_uvicorn_server: Optional[uvicorn.Server] = None
 
 
 def _bootstrap_defaults() -> None:
@@ -117,6 +127,36 @@ def _require_mode(mode: str) -> str:
 
 def _running_count() -> int:
     return sum(1 for snapshot in supervisor.list_account_snapshots() if snapshot.get("status") in {"running", "queued", "pausing", "stopping"})
+
+
+def _signal_server_shutdown() -> None:
+    if _uvicorn_server is not None:
+        _uvicorn_server.should_exit = True
+
+
+def _schedule_parent_console_close_if_configured() -> None:
+    if os.name != "nt":
+        return
+    if os.environ.get(_CLOSE_PARENT_CONSOLE_ENV) != "1":
+        return
+    parent_pid = os.getppid()
+    if parent_pid <= 1:
+        return
+    script = (
+        "import subprocess, time; "
+        "time.sleep(0.75); "
+        f"subprocess.run(['taskkill', '/PID', '{parent_pid}', '/T', '/F'], "
+        "stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)"
+    )
+    creationflags = 0
+    creationflags |= getattr(subprocess, "DETACHED_PROCESS", 0)
+    creationflags |= getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+    creationflags |= getattr(subprocess, "CREATE_NO_WINDOW", 0)
+    subprocess.Popen(
+        [sys.executable, "-c", script],
+        creationflags=creationflags,
+        close_fds=True,
+    )
 
 
 @app.get("/api/overview")
@@ -298,6 +338,15 @@ def patch_settings(payload: SettingsPatchPayload) -> Response:
     return JSONResponse(status_code=200, content={"app_settings": saved_app, "ui_settings": saved_ui})
 
 
+@app.post("/api/shutdown")
+def shutdown_webui(background_tasks: BackgroundTasks) -> Dict[str, Any]:
+    if _uvicorn_server is None:
+        raise HTTPException(status_code=503, detail="Shutdown is unavailable in this server context")
+    background_tasks.add_task(_signal_server_shutdown)
+    background_tasks.add_task(_schedule_parent_console_close_if_configured)
+    return {"ok": True, "message": "Shutdown requested"}
+
+
 @app.get("/api/queue")
 def get_queue(account_id: Optional[int] = Query(default=None)) -> Dict[str, Any]:
     return {"items": db.list_queue(account_id=account_id)}
@@ -367,8 +416,11 @@ async def websocket_live(ws: WebSocket) -> None:
 def spa_root() -> Response:
     index = DIST_DIR / "index.html"
     if index.exists():
-        return FileResponse(index)
-    return HTMLResponse("<h1>Mudae WebUI</h1><p>Frontend build not found. Run the WebUI build first.</p>")
+        return FileResponse(index, headers=SPA_HTML_HEADERS)
+    return HTMLResponse(
+        "<h1>Mudae WebUI</h1><p>Frontend build not found. Run the WebUI build first.</p>",
+        headers=SPA_HTML_HEADERS,
+    )
 
 
 @app.get("/{full_path:path}", include_in_schema=False, response_model=None)
@@ -380,15 +432,21 @@ def spa_fallback(full_path: str) -> Response:
         return FileResponse(candidate)
     index = DIST_DIR / "index.html"
     if index.exists():
-        return FileResponse(index)
-    return HTMLResponse("<h1>Mudae WebUI</h1><p>Frontend build not found. Run the WebUI build first.</p>")
+        return FileResponse(index, headers=SPA_HTML_HEADERS)
+    return HTMLResponse(
+        "<h1>Mudae WebUI</h1><p>Frontend build not found. Run the WebUI build first.</p>",
+        headers=SPA_HTML_HEADERS,
+    )
 
 
 def main() -> None:
+    global _uvicorn_server
     ui_settings = normalize_ui_settings(db.get_settings("ui_settings", DEFAULT_UI_SETTINGS))
     host = str(ui_settings.get("bind_host") or DEFAULT_UI_SETTINGS["bind_host"])
     port = int(ui_settings.get("bind_port") or DEFAULT_UI_SETTINGS["bind_port"])
-    uvicorn.run("mudae.web.server:app", host=host, port=port, reload=False)
+    server = uvicorn.Server(uvicorn.Config(app, host=host, port=port, reload=False))
+    _uvicorn_server = server
+    server.run()
 
 
 if __name__ == "__main__":

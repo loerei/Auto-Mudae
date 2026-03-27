@@ -229,3 +229,54 @@
     justify-items: stretch;
   }
 }
+
+.settings-shell {
+  grid-template-columns: minmax(240px, 280px) minmax(0, 1fr);
+  gap: 1.25rem;
+}
+
+.settings-sidebar-stack,
+.settings-sidebar-group,
+.settings-workspace-stack,
+.settings-group-stack,
+.settings-group-content,
+.settings-row-list,
+.settings-complex-stack {
+  display: grid;
+  gap: 1rem;
+}
+
+.settings-main {
+  display: grid;
+  gap: 1rem;
+  align-content: start;
+}
+
+.settings-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 1rem;
+  align-items: start;
+}
+
+.settings-row-control {
+  width: 100%;
+  justify-self: end;
+}
+
+.settings-sidebar-state {
+  display: inline-flex;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+  gap: 0.4rem;
+}
+
+@media (max-width: 960px) {
+  .settings-row {
+    grid-template-columns: 1fr;
+  }
+
+  .settings-row-control {
+    justify-self: stretch;
+  }
+}

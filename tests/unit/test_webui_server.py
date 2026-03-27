@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import os
+
 from fastapi.testclient import TestClient
 
 from mudae.web.db import WebDB
@@ -74,6 +76,61 @@ def test_webui_force_stop_and_clear_queue_endpoints_are_available(tmp_path, monk
     assert stop_response.json()["snapshot"]["status"] == "stopped"
 
 
+def test_webui_shutdown_endpoint_marks_server_for_exit(tmp_path, monkeypatch) -> None:
+    class DummyServer:
+        def __init__(self) -> None:
+            self.should_exit = False
+
+    temp_db = WebDB(tmp_path / "webui.db")
+    temp_supervisor = WebSupervisor(temp_db)
+    dummy_server = DummyServer()
+
+    monkeypatch.setattr(WebServer, "db", temp_db)
+    monkeypatch.setattr(WebServer, "supervisor", temp_supervisor)
+    monkeypatch.setattr(WebServer, "_uvicorn_server", dummy_server)
+    monkeypatch.setattr(WebServer, "build_initial_import_bundle", lambda: {"accounts": [], "wishlists": {"global": [], "accounts": {}}})
+
+    with TestClient(WebServer.app) as client:
+        response = client.post("/api/shutdown")
+
+    assert response.status_code == 200
+    assert response.json()["ok"] is True
+    assert dummy_server.should_exit is True
+
+
+def test_webui_shutdown_can_schedule_parent_console_close(tmp_path, monkeypatch) -> None:
+    class DummyServer:
+        def __init__(self) -> None:
+            self.should_exit = False
+
+    temp_db = WebDB(tmp_path / "webui.db")
+    temp_supervisor = WebSupervisor(temp_db)
+    dummy_server = DummyServer()
+    calls: list[str] = []
+
+    monkeypatch.setattr(WebServer, "db", temp_db)
+    monkeypatch.setattr(WebServer, "supervisor", temp_supervisor)
+    monkeypatch.setattr(WebServer, "_uvicorn_server", dummy_server)
+    monkeypatch.setattr(WebServer, "build_initial_import_bundle", lambda: {"accounts": [], "wishlists": {"global": [], "accounts": {}}})
+    monkeypatch.setattr(WebServer.os, "name", "nt")
+    monkeypatch.setattr(WebServer.os, "getppid", lambda: 4242)
+    monkeypatch.setenv("MUDAE_WEBUI_CLOSE_PARENT_CONSOLE", "1")
+
+    class DummyPopen:
+        def __init__(self, argv, **kwargs) -> None:
+            calls.append(" ".join(str(part) for part in argv))
+
+    monkeypatch.setattr(WebServer.subprocess, "Popen", DummyPopen)
+
+    with TestClient(WebServer.app) as client:
+        response = client.post("/api/shutdown")
+
+    assert response.status_code == 200
+    assert dummy_server.should_exit is True
+    assert calls
+    assert "taskkill" in calls[0]
+
+
 def test_webui_put_settings_normalizes_theme_defaults(tmp_path, monkeypatch) -> None:
     temp_db = WebDB(tmp_path / "webui.db")
     temp_supervisor = WebSupervisor(temp_db)
@@ -111,7 +168,16 @@ def test_webui_get_settings_schema_lists_sections_and_unknown_keys(tmp_path, mon
     payload = response.json()
 
     assert response.status_code == 200
-    assert any(section["id"] == "appearance" for section in payload["sections"])
+    appearance = next(section for section in payload["sections"] if section["id"] == "appearance")
+    runtime = next(section for section in payload["sections"] if section["id"] == "core_runtime_timing")
+    roll_claim = next(section for section in payload["sections"] if section["id"] == "roll_claim_react")
+    assert appearance["groups"][0]["id"] == "appearance_theme"
+    assert runtime["groups"][0]["id"] == "command_pacing"
+    short_delay = next(field for field in runtime["fields"] if field["key"] == "SLEEP_SHORT_SEC")
+    assert short_delay["label"] == "Short Delay"
+    assert short_delay["group"] == "command_pacing"
+    kakera_give = next(field for field in roll_claim["fields"] if field["key"] == "Kakera_Give")
+    assert kakera_give["validation"]["pair_labels"] == ["From Account ID", "To Account ID"]
     assert any(item["key"] == "UNKNOWN_FLAG" for item in payload["unknown_app_settings"])
 
 
@@ -153,3 +219,21 @@ def test_webui_patch_settings_returns_field_errors_for_invalid_values(tmp_path, 
     assert len(payload["field_errors"]) == 2
     assert any(item["key"] == "theme" for item in payload["field_errors"])
     assert any(item["key"] == "ROLLS_PER_RESET" for item in payload["field_errors"])
+
+
+def test_webui_spa_html_is_served_with_no_store_headers(tmp_path, monkeypatch) -> None:
+    temp_db = WebDB(tmp_path / "webui.db")
+    temp_supervisor = WebSupervisor(temp_db)
+
+    monkeypatch.setattr(WebServer, "db", temp_db)
+    monkeypatch.setattr(WebServer, "supervisor", temp_supervisor)
+    monkeypatch.setattr(WebServer, "build_initial_import_bundle", lambda: {"accounts": [], "wishlists": {"global": [], "accounts": {}}})
+
+    with TestClient(WebServer.app) as client:
+        root_response = client.get("/")
+        fallback_response = client.get("/settings")
+
+    assert root_response.status_code == 200
+    assert fallback_response.status_code == 200
+    assert root_response.headers["cache-control"] == "no-store, no-cache, must-revalidate"
+    assert fallback_response.headers["cache-control"] == "no-store, no-cache, must-revalidate"

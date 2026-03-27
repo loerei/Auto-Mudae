@@ -27,6 +27,7 @@ if defined PYTHONPATH (
 
 set "UI_DIR=%ROOT%webui"
 set "WEBUI_URL=http://127.0.0.1:8765/"
+set "MUDAE_WEBUI_CLOSE_PARENT_CONSOLE=1"
 
 cd /d "%ROOT%"
 

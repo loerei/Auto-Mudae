@@ -1,9 +1,10 @@
-import { FormEvent, ReactNode, useEffect, useMemo, useRef, useState } from "react";
+import { Component, ErrorInfo, FormEvent, ReactNode, useEffect, useMemo, useRef, useState } from "react";
 
 import { AnimatePresence, MotionConfig, motion, useReducedMotion } from "framer-motion";
 
 import { DashboardPanel, LiveDashboard, LogPayloadView, OverviewCard, StatusChip, fmtTime } from "./live-ui";
 import { buildFadeUp, buildHighlightFlash, buildStaggerContainer, getTabTransition } from "./motion";
+import { LEGACY_SECTION_GROUPS, SETTINGS_COMPAT_FIELD_META } from "./settings-compat";
 import { normalizeUiSettings, useResolvedTheme } from "./theme";
 import { SettingsWorkspace, THEME_LABELS } from "./settings-ui";
 import {
@@ -61,6 +62,202 @@ function toLocalInputValue(date: Date): string {
 
 function emptyWishlistRow(): WishlistItem {
   return { name: "", priority: 2, is_star: false };
+}
+
+function closeWebUiTabBestEffort(): void {
+  window.setTimeout(() => {
+    try {
+      window.close();
+    } catch {
+      // Ignore close failures; browsers often block closing tabs not opened by script.
+    }
+    window.setTimeout(() => {
+      if (!document.hidden) {
+        window.location.replace("about:blank");
+      }
+    }, 180);
+  }, 220);
+}
+
+function normalizeSettingsSchemaPayload(payload: unknown): SettingsSchema {
+  const raw = payload && typeof payload === "object" ? (payload as Record<string, unknown>) : {};
+  const rawSections = Array.isArray(raw.sections) ? raw.sections : [];
+  const sections = rawSections
+    .map((item, index) => normalizeSettingsSection(item, index))
+    .filter((section): section is SettingsSchema["sections"][number] => section != null);
+  const unknownAppSettings = Array.isArray(raw.unknown_app_settings)
+    ? raw.unknown_app_settings
+        .filter((item): item is Record<string, unknown> => Boolean(item) && typeof item === "object")
+        .map((item) => ({
+          source: item.source === "ui_settings" ? "ui_settings" : "app_settings",
+          key: typeof item.key === "string" ? item.key : "unknown",
+          label: typeof item.label === "string" ? item.label : typeof item.key === "string" ? item.key : "Unknown key",
+          value: "value" in item ? item.value : null
+        }))
+    : [];
+  const sources =
+    raw.sources && typeof raw.sources === "object"
+      ? Object.fromEntries(Object.entries(raw.sources as Record<string, unknown>).map(([key, value]) => [key, typeof value === "string" ? value : String(value ?? "")]))
+      : {};
+  return {
+    sections,
+    unknown_app_settings: unknownAppSettings,
+    sources
+  };
+}
+
+function normalizeSettingsSection(rawSection: unknown, index: number): SettingsSchema["sections"][number] | null {
+  if (!rawSection || typeof rawSection !== "object") return null;
+  const section = rawSection as Record<string, unknown>;
+  const sectionId = typeof section.id === "string" && section.id.trim() ? section.id : `section_${index}`;
+  const usingLegacySectionSchema = !Array.isArray(section.groups);
+  const fields = Array.isArray(section.fields)
+    ? section.fields
+        .filter((item): item is Record<string, unknown> => Boolean(item) && typeof item === "object")
+        .map((field) => normalizeSettingsField(field, sectionId, usingLegacySectionSchema))
+    : [];
+  const groups = Array.isArray(section.groups)
+    ? section.groups
+        .filter((item): item is Record<string, unknown> => Boolean(item) && typeof item === "object")
+        .map((group, groupIndex) => normalizeSettingsGroup(group, fields, sectionId, groupIndex))
+    : [];
+  const normalizedGroups = groups.length > 0 ? groups : buildLegacySettingsGroups(sectionId, fields);
+  return {
+    id: sectionId,
+    title: typeof section.title === "string" && section.title.trim() ? section.title : sectionId,
+    description: typeof section.description === "string" ? section.description : "",
+    groups: normalizedGroups,
+    fields,
+    section_apply_scope: typeof section.section_apply_scope === "string" ? section.section_apply_scope : undefined,
+    dangerous: Boolean(section.dangerous)
+  };
+}
+
+function normalizeSettingsGroup(
+  rawGroup: Record<string, unknown>,
+  fields: SettingsSchema["sections"][number]["fields"],
+  sectionId: string,
+  index: number
+): SettingsSchema["sections"][number]["groups"][number] {
+  const groupId = typeof rawGroup.id === "string" && rawGroup.id.trim() ? rawGroup.id : `${sectionId}.group_${index}`;
+  const groupFieldKeys = Array.isArray(rawGroup.fields)
+    ? new Set(
+        rawGroup.fields
+          .filter((item): item is Record<string, unknown> => Boolean(item) && typeof item === "object")
+          .map((field) => (typeof field.key === "string" ? field.key : ""))
+          .filter(Boolean)
+      )
+    : null;
+  const groupFields = groupFieldKeys ? fields.filter((field) => groupFieldKeys.has(field.key)) : fields.filter((field) => field.group === groupId);
+  return {
+    id: groupId,
+    title: typeof rawGroup.title === "string" && rawGroup.title.trim() ? rawGroup.title : "Settings Group",
+    description: typeof rawGroup.description === "string" ? rawGroup.description : "",
+    fields: groupFields,
+    apply_scope: typeof rawGroup.apply_scope === "string" ? rawGroup.apply_scope : undefined,
+    layout_hint: typeof rawGroup.layout_hint === "string" ? rawGroup.layout_hint : undefined,
+    default_collapsed: Boolean(rawGroup.default_collapsed),
+    dangerous: Boolean(rawGroup.dangerous)
+  };
+}
+
+function buildLegacySettingsGroups(sectionId: string, fields: SettingsSchema["sections"][number]["fields"]): SettingsSchema["sections"][number]["groups"] {
+  const definitions = LEGACY_SECTION_GROUPS[sectionId];
+  if (!definitions || definitions.length === 0) {
+    return [
+      {
+        id: `${sectionId}.legacy`,
+        title: "Section Settings",
+        description: "This section is being rendered from a compatibility schema.",
+        fields,
+        layout_hint: "rows",
+        default_collapsed: false,
+        dangerous: false
+      }
+    ];
+  }
+  const leftovers = new Set(fields.map((field) => field.key));
+  const groups = definitions
+    .map((definition) => {
+      const groupFields = fields.filter((field) => definition.fieldKeys.includes(field.key));
+      for (const field of groupFields) leftovers.delete(field.key);
+      if (groupFields.length === 0) return null;
+      return {
+        id: definition.id,
+        title: definition.title,
+        description: definition.description,
+        fields: groupFields,
+        apply_scope: coalesceSectionScope(groupFields),
+        layout_hint: definition.layoutHint,
+        default_collapsed: Boolean(definition.defaultCollapsed),
+        dangerous: Boolean(definition.dangerous)
+      };
+    })
+    .filter((group): group is NonNullable<typeof group> => group != null);
+  if (leftovers.size > 0) {
+    groups.push({
+      id: `${sectionId}.legacy_misc`,
+      title: "Additional Settings",
+      description: "Settings from the legacy schema that do not map to a known group yet.",
+      fields: fields.filter((field) => leftovers.has(field.key)),
+      apply_scope: coalesceSectionScope(fields.filter((field) => leftovers.has(field.key))),
+      layout_hint: "rows",
+      default_collapsed: false,
+      dangerous: false
+    });
+  }
+  return groups;
+}
+
+function normalizeSettingsField(
+  rawField: Record<string, unknown>,
+  sectionId: string,
+  useCompatibilityMetadata = false
+): SettingsSchema["sections"][number]["fields"][number] {
+  const key = typeof rawField.key === "string" && rawField.key.trim() ? rawField.key : `field_${Math.random().toString(36).slice(2, 8)}`;
+  const compat = useCompatibilityMetadata ? SETTINGS_COMPAT_FIELD_META[key] : undefined;
+  const validation = rawField.validation && typeof rawField.validation === "object" ? { ...(rawField.validation as Record<string, unknown>) } : {};
+  if (compat?.pairLabels && (!Array.isArray(validation.pair_labels) || validation.pair_labels.length < 2 || String(validation.pair_labels[0]) === "Target ID")) {
+    validation.pair_labels = compat.pairLabels;
+  }
+  return {
+    key,
+    source: rawField.source === "ui_settings" ? "ui_settings" : "app_settings",
+    section: typeof rawField.section === "string" && rawField.section.trim() ? rawField.section : sectionId,
+    group: typeof rawField.group === "string" && rawField.group.trim() ? rawField.group : `${sectionId}.legacy`,
+    label: compat?.label ?? (typeof rawField.label === "string" && rawField.label.trim() ? rawField.label : key),
+    short_label: typeof rawField.short_label === "string" ? rawField.short_label : undefined,
+    description: typeof rawField.description === "string" ? rawField.description : "",
+    help_text: compat?.helpText ?? (typeof rawField.help_text === "string" ? rawField.help_text : undefined),
+    editor: typeof rawField.editor === "string" ? rawField.editor : "text",
+    value_type: typeof rawField.value_type === "string" ? rawField.value_type : "string",
+    default: "default" in rawField ? rawField.default : null,
+    value: "value" in rawField ? rawField.value : null,
+    options: Array.isArray(rawField.options)
+      ? rawField.options
+          .filter((item): item is Record<string, unknown> => Boolean(item) && typeof item === "object")
+          .map((item) => ({
+            value: typeof item.value === "string" ? item.value : String(item.value ?? ""),
+            label: typeof item.label === "string" ? item.label : String(item.value ?? "")
+          }))
+      : [],
+    validation,
+    apply_scope: typeof rawField.apply_scope === "string" ? rawField.apply_scope : "Next session",
+    dangerous: Boolean(rawField.dangerous),
+    editable: rawField.editable !== false,
+    unit: compat?.unit ?? (typeof rawField.unit === "string" ? rawField.unit : undefined),
+    placeholder: typeof rawField.placeholder === "string" ? rawField.placeholder : undefined,
+    control_width: compat?.controlWidth ?? (typeof rawField.control_width === "string" ? rawField.control_width : undefined),
+    layout_hint: compat?.layoutHint ?? (typeof rawField.layout_hint === "string" ? rawField.layout_hint : undefined),
+    show_apply_scope: Boolean(rawField.show_apply_scope)
+  };
+}
+
+function coalesceSectionScope(fields: SettingsSchema["sections"][number]["fields"]): string | undefined {
+  const scopes = Array.from(new Set(fields.map((field) => field.apply_scope).filter(Boolean)));
+  if (scopes.length === 1) return scopes[0];
+  if (scopes.length === 0) return undefined;
+  return "Mixed";
 }
 
 function matchesLogFilters(item: EventItem, logMode: string, logLevel: string): boolean {
@@ -165,6 +362,41 @@ function WishlistEditor(props: {
   );
 }
 
+class SettingsErrorBoundary extends Component<{ children: ReactNode }, { hasError: boolean }> {
+  constructor(props: { children: ReactNode }) {
+    super(props);
+    this.state = { hasError: false };
+  }
+
+  static getDerivedStateFromError(): { hasError: boolean } {
+    return { hasError: true };
+  }
+
+  componentDidCatch(error: Error, info: ErrorInfo) {
+    console.error("SettingsErrorBoundary", error, info);
+  }
+
+  render() {
+    if (this.state.hasError) {
+      return (
+        <section className="panel">
+          <div className="panel-header">
+            <h3>Settings Unavailable</h3>
+            <button type="button" onClick={() => window.location.reload()}>
+              Reload
+            </button>
+          </div>
+          <p className="muted">
+            The Settings workspace hit an unexpected render error. Reload the page first. If it keeps happening, restart the local daemon so the
+            frontend and backend schema stay in sync.
+          </p>
+        </section>
+      );
+    }
+    return this.props.children;
+  }
+}
+
 export default function App() {
   const reducedMotion = useReducedMotion();
   const [activeTab, setActiveTab] = useState<(typeof TABS)[number]>("Overview");
@@ -187,6 +419,7 @@ export default function App() {
   const [scheduleMode, setScheduleMode] = useState<string>("main");
   const [scheduleAt, setScheduleAt] = useState<string>(toLocalInputValue(new Date(Date.now() + 10 * 60 * 1000)));
   const [pendingLogCount, setPendingLogCount] = useState(0);
+  const [isShuttingDown, setIsShuttingDown] = useState(false);
 
   const logListRef = useRef<HTMLDivElement | null>(null);
   const isLogAtLiveEdgeRef = useRef(true);
@@ -261,7 +494,7 @@ export default function App() {
       setSettingsSchemaError(message);
       throw new Error(message);
     }
-    const payload = (await response.json()) as SettingsSchema;
+    const payload = normalizeSettingsSchemaPayload(await response.json());
     setSettingsSchema(payload);
     setSettingsSchemaError(null);
   }
@@ -341,6 +574,18 @@ export default function App() {
     const nextTheme = order[(order.indexOf(themeMode) + 1 + order.length) % order.length];
     await patchSettings({ ui_settings: { theme: nextTheme } });
     setNotice(`Theme set to ${THEME_LABELS[nextTheme]}.`);
+  }
+
+  async function shutdownWebUi() {
+    setIsShuttingDown(true);
+    try {
+      await fetchJson<{ ok: boolean; message: string }>("/api/shutdown", { method: "POST" });
+      setNotice("Shutting down local daemon and closing WebUI tab...");
+      closeWebUiTabBestEffort();
+    } catch (error) {
+      setIsShuttingDown(false);
+      throw error;
+    }
   }
 
   async function saveGlobalWishlist() {
@@ -535,6 +780,14 @@ export default function App() {
               </button>
               <button type="button" onClick={() => void refreshAll().catch((error: Error) => setNotice(error.message))}>
                 Refresh
+              </button>
+              <button
+                className="danger"
+                type="button"
+                disabled={isShuttingDown}
+                onClick={() => void shutdownWebUi().catch((error: Error) => setNotice(error.message))}
+              >
+                {isShuttingDown ? "Shutting Down..." : "Shutdown WebUI"}
               </button>
             </div>
           </div>
@@ -896,16 +1149,18 @@ export default function App() {
                   </div>
                 }
               />
-              <SettingsWorkspace
-                settings={settings}
-                schema={settingsSchema}
-                schemaError={settingsSchemaError}
-                resolvedTheme={resolvedTheme}
-                onPatch={patchSettings}
-                onExport={exportData}
-                onImport={importData}
-                onNotice={setNotice}
-              />
+              <SettingsErrorBoundary>
+                <SettingsWorkspace
+                  settings={settings}
+                  schema={settingsSchema}
+                  schemaError={settingsSchemaError}
+                  resolvedTheme={resolvedTheme}
+                  onPatch={patchSettings}
+                  onExport={exportData}
+                  onImport={importData}
+                  onNotice={setNotice}
+                />
+              </SettingsErrorBoundary>
             </motion.section>
           )}
         </AnimatePresence>

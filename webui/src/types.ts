@@ -195,8 +195,11 @@ export type SettingsField = {
   key: string;
   source: SettingsSource;
   section: string;
+  group: string;
   label: string;
+  short_label?: string;
   description: string;
+  help_text?: string;
   editor: string;
   value_type: string;
   default: unknown;
@@ -206,13 +209,32 @@ export type SettingsField = {
   apply_scope: string;
   dangerous: boolean;
   editable: boolean;
+  unit?: string;
+  placeholder?: string;
+  control_width?: string;
+  layout_hint?: string;
+  show_apply_scope?: boolean;
+};
+
+export type SettingsGroup = {
+  id: string;
+  title: string;
+  description: string;
+  fields: SettingsField[];
+  apply_scope?: string;
+  layout_hint?: string;
+  default_collapsed?: boolean;
+  dangerous?: boolean;
 };
 
 export type SettingsSection = {
   id: string;
   title: string;
   description: string;
+  groups: SettingsGroup[];
   fields: SettingsField[];
+  section_apply_scope?: string;
+  dangerous?: boolean;
 };
 
 export type UnknownSetting = {

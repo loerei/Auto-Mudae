@@ -1,10 +1,11 @@
-import { ChangeEvent, useEffect, useState } from "react";
+import { ChangeEvent, useEffect, useMemo, useState } from "react";
 
 import { DashboardPanel, StatusChip } from "./live-ui";
 import { DEFAULT_UI_SETTINGS, normalizeUiSettings } from "./theme";
 import {
   FieldError,
   SettingsField,
+  SettingsGroup,
   SettingsPayload,
   SettingsSchema,
   SettingsSection,
@@ -13,6 +14,16 @@ import {
 } from "./types";
 
 export const THEME_LABELS: Record<ThemeMode, string> = { system: "System", light: "Light", dark: "Dark" };
+
+const SETTINGS_HASH_PREFIX = "#settings:";
+const SETTINGS_VIEW_STORAGE_KEY = "mudae.settings.active-view";
+const SIMPLE_FIELD_EDITORS = new Set(["toggle", "select", "number", "text"]);
+const UTILITY_VIEWS = [
+  { id: "unknown", title: "Unknown / Unsupported", description: "Read-only keys preserved in storage but not yet promoted to full WebUI controls." },
+  { id: "backup", title: "Backup / Restore", description: "Export or import a full local settings bundle." }
+] as const;
+
+type SettingsViewId = string;
 
 type SettingsWorkspaceProps = {
   settings: SettingsPayload | null;
@@ -30,6 +41,8 @@ export function SettingsWorkspace(props: SettingsWorkspaceProps) {
   const [uiDraft, setUiDraft] = useState<Record<string, unknown>>(DEFAULT_UI_SETTINGS);
   const [fieldErrors, setFieldErrors] = useState<Record<string, string>>({});
   const [importText, setImportText] = useState("");
+  const [activeViewId, setActiveViewId] = useState<SettingsViewId>("appearance");
+  const [collapsedGroups, setCollapsedGroups] = useState<Record<string, boolean>>({});
 
   useEffect(() => {
     setAppDraft(props.settings?.app_settings ?? {});
@@ -39,9 +52,55 @@ export function SettingsWorkspace(props: SettingsWorkspaceProps) {
 
   const sections = props.schema?.sections ?? [];
   const unknownSettings = props.schema?.unknown_app_settings ?? [];
+  const usingLegacySchema = useMemo(() => sections.some((section) => !Array.isArray((section as { groups?: unknown }).groups)), [sections]);
 
   const savedAppSettings = props.settings?.app_settings ?? {};
   const savedUiSettings = normalizeUiSettings(props.settings?.ui_settings);
+
+  useEffect(() => {
+    if (!sections.length) return;
+    setCollapsedGroups((current) => {
+      const next = { ...current };
+      let changed = false;
+      for (const section of sections) {
+        for (const group of getSectionGroups(section)) {
+          const key = makeGroupStateKey(section.id, group.id);
+          if (!(key in next)) {
+            next[key] = Boolean(group.default_collapsed);
+            changed = true;
+          }
+        }
+      }
+      return changed ? next : current;
+    });
+  }, [sections]);
+
+  useEffect(() => {
+    if (!sections.length) return;
+    setActiveViewId((current) => {
+      if (isValidSettingsViewId(current, sections)) return current;
+      return getPreferredSettingsView(sections);
+    });
+  }, [sections]);
+
+  useEffect(() => {
+    if (!sections.length || !isValidSettingsViewId(activeViewId, sections)) return;
+    persistSettingsView(activeViewId);
+  }, [activeViewId, sections]);
+
+  useEffect(() => {
+    if (!sections.length || typeof window === "undefined") return;
+    const handleHashChange = () => {
+      const candidate = readHashViewId();
+      if (candidate && isValidSettingsViewId(candidate, sections)) {
+        setActiveViewId(candidate);
+      }
+    };
+    window.addEventListener("hashchange", handleHashChange);
+    return () => window.removeEventListener("hashchange", handleHashChange);
+  }, [sections]);
+
+  const activeSection = useMemo(() => sections.find((section) => section.id === activeViewId) ?? null, [activeViewId, sections]);
 
   function getFieldValue(field: SettingsField): unknown {
     if (field.source === "ui_settings") {
@@ -73,8 +132,8 @@ export function SettingsWorkspace(props: SettingsWorkspaceProps) {
     });
   }
 
-  function getSectionScopes(section: SettingsSection): string[] {
-    return Array.from(new Set(section.fields.map((field) => field.apply_scope))).filter(Boolean);
+  function getSectionErrorCount(section: SettingsSection): number {
+    return section.fields.reduce((count, field) => count + (fieldErrors[`${field.source}.${field.key}`] ? 1 : 0), 0);
   }
 
   function getSectionPatch(section: SettingsSection): Partial<SettingsPayload> {
@@ -95,10 +154,33 @@ export function SettingsWorkspace(props: SettingsWorkspaceProps) {
   }
 
   function resetSection(section: SettingsSection) {
-    for (const field of section.fields) {
-      const saved = field.source === "ui_settings" ? savedUiSettings[field.key] : savedAppSettings[field.key];
-      setFieldValue(field, cloneValue(saved ?? field.default));
-    }
+    setAppDraft((prev) => {
+      const next = { ...prev };
+      for (const field of section.fields) {
+        if (field.source === "app_settings") {
+          const saved = savedAppSettings[field.key];
+          next[field.key] = cloneValue(saved ?? field.default);
+        }
+      }
+      return next;
+    });
+    setUiDraft((prev) => {
+      const next = { ...prev };
+      for (const field of section.fields) {
+        if (field.source === "ui_settings") {
+          const saved = savedUiSettings[field.key];
+          next[field.key] = cloneValue(saved ?? field.default);
+        }
+      }
+      return next;
+    });
+    setFieldErrors((prev) => {
+      const next = { ...prev };
+      for (const field of section.fields) {
+        delete next[`${field.source}.${field.key}`];
+      }
+      return next;
+    });
   }
 
   async function saveSection(section: SettingsSection) {
@@ -126,6 +208,11 @@ export function SettingsWorkspace(props: SettingsWorkspaceProps) {
     }
   }
 
+  function toggleGroup(sectionId: string, groupId: string) {
+    const key = makeGroupStateKey(sectionId, groupId);
+    setCollapsedGroups((prev) => ({ ...prev, [key]: !prev[key] }));
+  }
+
   async function handleImport() {
     await props.onImport(importText);
     setImportText("");
@@ -151,143 +238,290 @@ export function SettingsWorkspace(props: SettingsWorkspaceProps) {
       <aside className="panel settings-sidebar">
         <div className="panel-header">
           <div>
-            <h3>Categories</h3>
-            <p className="muted">Jump between structured sections without leaving the page.</p>
+            <h3>Settings</h3>
+            <p className="muted">Work through one focused section at a time instead of a single wall of fields.</p>
           </div>
         </div>
-        <nav className="settings-nav">
-          {sections.map((section) => (
-            <button key={section.id} type="button" className="sidebar-item" onClick={() => scrollToSettingsSection(section.id)}>
-              <span className="sidebar-main">
-                <strong>{section.title}</strong>
-                <small>{section.fields.length} field{section.fields.length === 1 ? "" : "s"}</small>
-              </span>
-            </button>
-          ))}
-          <button type="button" className="sidebar-item" onClick={() => scrollToSettingsSection("unknown")}>
-            <span className="sidebar-main">
-              <strong>Unknown / Unsupported</strong>
-              <small>{unknownSettings.length} item{unknownSettings.length === 1 ? "" : "s"}</small>
-            </span>
-          </button>
-          <button type="button" className="sidebar-item" onClick={() => scrollToSettingsSection("backup")}>
-            <span className="sidebar-main">
-              <strong>Backup / Restore</strong>
-              <small>Export and import portable bundles</small>
-            </span>
-          </button>
-        </nav>
+
+        <div className="settings-sidebar-stack">
+          <section className="settings-sidebar-group">
+            <p className="eyebrow">Sections</p>
+            <nav className="settings-nav">
+              {sections.map((section) => {
+                const dirty = isSectionDirty(section);
+                const errorCount = getSectionErrorCount(section);
+                const active = activeViewId === section.id;
+                return (
+                  <button
+                    key={section.id}
+                    type="button"
+                    className={`sidebar-item ${active ? "active" : ""}`.trim()}
+                    onClick={() => setActiveSettingsView(section.id, setActiveViewId)}
+                  >
+                    <span className="sidebar-main">
+                      <strong>{section.title}</strong>
+                      <small>{getSectionGroups(section).length} group{getSectionGroups(section).length === 1 ? "" : "s"}</small>
+                    </span>
+                    <span className="settings-sidebar-state">
+                      {errorCount > 0 && <StatusChip tone="error">{errorCount} error{errorCount === 1 ? "" : "s"}</StatusChip>}
+                      {dirty && <StatusChip tone="warning">Unsaved</StatusChip>}
+                    </span>
+                  </button>
+                );
+              })}
+            </nav>
+          </section>
+
+          <section className="settings-sidebar-group settings-sidebar-utility">
+            <p className="eyebrow">Utilities</p>
+            <nav className="settings-nav">
+              {UTILITY_VIEWS.map((view) => (
+                <button
+                  key={view.id}
+                  type="button"
+                  className={`sidebar-item ${activeViewId === view.id ? "active" : ""}`.trim()}
+                  onClick={() => setActiveSettingsView(view.id, setActiveViewId)}
+                >
+                  <span className="sidebar-main">
+                    <strong>{view.title}</strong>
+                    <small>{view.description}</small>
+                  </span>
+                </button>
+              ))}
+            </nav>
+          </section>
+        </div>
       </aside>
 
       <div className="settings-main">
-        {sections.map((section) => {
-          const dirty = isSectionDirty(section);
-          const scopes = getSectionScopes(section);
-          const hasDangerousFields = section.fields.some((field) => field.dangerous);
-          return (
-            <DashboardPanel
-              key={section.id}
-              className="settings-section"
-              title={section.title}
-              subtitle={section.description}
-              actions={
-                <div className="panel-actions">
-                  {dirty && <StatusChip tone="warning">Unsaved</StatusChip>}
-                  <button className="primary" type="button" disabled={!dirty} onClick={() => void saveSection(section)}>
-                    Save
-                  </button>
-                  <button type="button" disabled={!dirty} onClick={() => resetSection(section)}>
-                    Reset
-                  </button>
-                </div>
-              }
-            >
-              <div id={`settings-${section.id}`} className="settings-section-stack">
-                <div className="badge-row">
-                  {scopes.map((scope) => (
-                    <StatusChip key={scope} tone={scope === "Immediate" ? "success" : scope === "Daemon restart" ? "warning" : "neutral"}>
-                      {scope}
-                    </StatusChip>
-                  ))}
-                  {hasDangerousFields && <StatusChip tone="warning">Advanced / Sensitive</StatusChip>}
-                </div>
-                {hasDangerousFields && (
-                  <div className="settings-warning">
-                    These fields are low-level integration settings. Incorrect values can break connectivity or target the wrong server/channel.
-                  </div>
-                )}
-                <div className="settings-form-grid">
-                  {section.fields.map((field) => (
-                    <SettingFieldCard
-                      key={`${field.source}-${field.key}`}
-                      field={field}
-                      value={getFieldValue(field)}
-                      error={fieldErrors[`${field.source}.${field.key}`]}
-                      resolvedTheme={props.resolvedTheme}
-                      onChange={(value) => setFieldValue(field, value)}
-                    />
-                  ))}
-                </div>
-              </div>
-            </DashboardPanel>
-          );
-        })}
-
-        <DashboardPanel
-          className="settings-section"
-          title="Unknown / Unsupported"
-          subtitle="These keys are preserved in storage but do not yet have first-class controls in the WebUI."
-        >
-          <div id="settings-unknown" className="settings-section-stack">
-            {unknownSettings.length === 0 ? (
-              <p className="muted">No unsupported app settings are currently stored.</p>
-            ) : (
-              <div className="unknown-settings-list">
-                {unknownSettings.map((item) => (
-                  <UnknownSettingCard key={item.key} item={item} />
-                ))}
-              </div>
-            )}
-          </div>
-        </DashboardPanel>
-
-        <DashboardPanel className="settings-section" title="Backup / Restore" subtitle="Export a full local bundle or import one after stopping live sessions.">
-          <div id="settings-backup" className="settings-section-stack">
-            <div className="button-row">
-              <button className="primary" type="button" onClick={() => void props.onExport()}>
-                Export Backup
-              </button>
-            </div>
-            <input type="file" accept="application/json" onChange={handleImportFile} />
-            <textarea className="code-block" value={importText} onChange={(event) => setImportText(event.target.value)} placeholder="Paste exported JSON here" />
-            <div className="button-row">
-              <button className="primary" type="button" disabled={!importText.trim()} onClick={() => void handleImport()}>
-                Import Backup
-              </button>
-            </div>
-          </div>
-        </DashboardPanel>
+        {activeSection ? (
+          <ActiveSettingsSection
+            usingLegacySchema={usingLegacySchema}
+            section={activeSection}
+            dirty={isSectionDirty(activeSection)}
+            errorCount={getSectionErrorCount(activeSection)}
+            collapsedGroups={collapsedGroups}
+            resolvedTheme={props.resolvedTheme}
+            getFieldValue={getFieldValue}
+            getFieldError={(field) => fieldErrors[`${field.source}.${field.key}`]}
+            onFieldChange={setFieldValue}
+            onReset={() => resetSection(activeSection)}
+            onSave={() => void saveSection(activeSection)}
+            onToggleGroup={(groupId) => toggleGroup(activeSection.id, groupId)}
+          />
+        ) : activeViewId === "unknown" ? (
+          <UnknownSettingsView unknownSettings={unknownSettings} />
+        ) : (
+          <BackupRestoreView
+            importText={importText}
+            onImportTextChange={setImportText}
+            onImportFile={handleImportFile}
+            onExport={() => void props.onExport()}
+            onImport={() => void handleImport()}
+          />
+        )}
       </div>
     </section>
   );
 }
 
-function SettingFieldCard(props: {
+function ActiveSettingsSection(props: {
+  usingLegacySchema: boolean;
+  section: SettingsSection;
+  dirty: boolean;
+  errorCount: number;
+  collapsedGroups: Record<string, boolean>;
+  resolvedTheme: string;
+  getFieldValue: (field: SettingsField) => unknown;
+  getFieldError: (field: SettingsField) => string | undefined;
+  onFieldChange: (field: SettingsField, value: unknown) => void;
+  onReset: () => void;
+  onSave: () => void;
+  onToggleGroup: (groupId: string) => void;
+}) {
+  const sectionGroups = getSectionGroups(props.section);
+  const sectionScopes = uniq(props.section.fields.map((field) => field.apply_scope).filter(Boolean));
+  return (
+    <DashboardPanel
+      className="settings-workspace-panel"
+      title={props.section.title}
+      subtitle={props.section.description}
+      actions={
+        <div className="panel-actions">
+          {props.dirty && <StatusChip tone="warning">Unsaved</StatusChip>}
+          <button className="primary" type="button" disabled={!props.dirty} onClick={props.onSave}>
+            Save Section
+          </button>
+          <button type="button" disabled={!props.dirty} onClick={props.onReset}>
+            Reset
+          </button>
+        </div>
+      }
+    >
+      <div className="settings-workspace-stack">
+        <div className="badge-row">
+          {sectionScopes.map((scope) => (
+            <StatusChip key={scope} tone={scope === "Immediate" ? "success" : scope === "Daemon restart" ? "warning" : "neutral"}>
+              {scope}
+            </StatusChip>
+          ))}
+          {props.section.dangerous && <StatusChip tone="warning">Advanced / Sensitive</StatusChip>}
+        </div>
+        {props.usingLegacySchema && (
+          <div className="settings-warning">
+            Compatibility mode: this daemon is still serving the older flat settings schema. The page remains usable, but restart the daemon to get grouped sections and fully polished labels.
+          </div>
+        )}
+        {props.errorCount > 0 && (
+          <div className="settings-error-strip">
+            {props.errorCount} field error{props.errorCount === 1 ? "" : "s"} need attention before this section can be saved cleanly.
+          </div>
+        )}
+        <div className="settings-group-stack">
+          {sectionGroups.map((group) => {
+            const collapsed = props.collapsedGroups[makeGroupStateKey(props.section.id, group.id)] ?? Boolean(group.default_collapsed);
+            return (
+              <SettingsGroupBlock
+                key={group.id}
+                section={props.section}
+                group={group}
+                collapsed={collapsed}
+                resolvedTheme={props.resolvedTheme}
+                getFieldValue={props.getFieldValue}
+                getFieldError={props.getFieldError}
+                onFieldChange={props.onFieldChange}
+                onToggle={() => props.onToggleGroup(group.id)}
+              />
+            );
+          })}
+        </div>
+      </div>
+    </DashboardPanel>
+  );
+}
+
+function SettingsGroupBlock(props: {
+  section: SettingsSection;
+  group: SettingsGroup;
+  collapsed: boolean;
+  resolvedTheme: string;
+  getFieldValue: (field: SettingsField) => unknown;
+  getFieldError: (field: SettingsField) => string | undefined;
+  onFieldChange: (field: SettingsField, value: unknown) => void;
+  onToggle: () => void;
+}) {
+  const groupScope = props.group.apply_scope && props.group.apply_scope !== "Mixed" ? props.group.apply_scope : null;
+  const simpleFields = props.group.fields.filter((field) => isSimpleField(field));
+  const complexFields = props.group.fields.filter((field) => !isSimpleField(field));
+
+  return (
+    <section className={`panel settings-group-panel ${props.group.dangerous ? "danger-zone" : ""}`.trim()}>
+      <div className="settings-group-header">
+        <div className="settings-group-copy">
+          <h4>{props.group.title}</h4>
+          {props.group.description && <p className="muted">{props.group.description}</p>}
+        </div>
+        <div className="settings-group-actions">
+          {groupScope && (
+            <StatusChip tone={groupScope === "Immediate" ? "success" : groupScope === "Daemon restart" ? "warning" : "neutral"}>
+              {groupScope}
+            </StatusChip>
+          )}
+          {props.group.dangerous && <StatusChip tone="warning">Advanced</StatusChip>}
+          <button type="button" className="ghost" onClick={props.onToggle}>
+            {props.collapsed ? "Expand" : "Collapse"}
+          </button>
+        </div>
+      </div>
+
+      {!props.collapsed && (
+        <div className="settings-group-content">
+          {props.group.dangerous && (
+            <div className="settings-warning">These controls are low-level and can break connectivity or point the runtime at the wrong Discord target.</div>
+          )}
+          {simpleFields.length > 0 && (
+            <div className="settings-row-list">
+              {simpleFields.map((field) => (
+                <SettingFieldRow
+                  key={`${field.source}-${field.key}`}
+                  field={field}
+                  value={props.getFieldValue(field)}
+                  error={props.getFieldError(field)}
+                  groupScope={groupScope}
+                  resolvedTheme={props.resolvedTheme}
+                  onChange={(value) => props.onFieldChange(field, value)}
+                />
+              ))}
+            </div>
+          )}
+          {complexFields.length > 0 && (
+            <div className="settings-complex-stack">
+              {complexFields.map((field) => (
+                <SettingFieldPanel
+                  key={`${field.source}-${field.key}`}
+                  field={field}
+                  value={props.getFieldValue(field)}
+                  error={props.getFieldError(field)}
+                  groupScope={groupScope}
+                  resolvedTheme={props.resolvedTheme}
+                  onChange={(value) => props.onFieldChange(field, value)}
+                />
+              ))}
+            </div>
+          )}
+        </div>
+      )}
+    </section>
+  );
+}
+
+function SettingFieldRow(props: {
   field: SettingsField;
   value: unknown;
   error?: string;
+  groupScope: string | null;
   resolvedTheme: string;
   onChange: (value: unknown) => void;
 }) {
+  const showScopeChip = props.field.show_apply_scope || !props.groupScope || props.groupScope !== props.field.apply_scope;
   return (
-    <section className={`panel inset settings-field-card ${props.field.dangerous ? "danger-zone" : ""}`.trim()}>
+    <div className={`settings-row ${props.error ? "has-error" : ""} ${props.field.dangerous ? "danger-zone" : ""}`.trim()}>
+      <div className="settings-row-copy">
+        <div className="settings-row-heading">
+          <strong>{props.field.label}</strong>
+          <div className="badge-row">
+            {showScopeChip && <StatusChip tone="neutral">{props.field.apply_scope}</StatusChip>}
+            {props.field.key === "theme" && <StatusChip tone="neutral">Resolved: {props.resolvedTheme}</StatusChip>}
+          </div>
+        </div>
+        {props.field.help_text ? <p className="muted">{props.field.help_text}</p> : props.field.description ? <p className="muted">{props.field.description}</p> : null}
+        {props.error && <p className="field-error">{props.error}</p>}
+      </div>
+      <div className={`settings-row-control control-width-${getControlWidth(props.field)}`}>
+        <SettingEditor field={props.field} value={props.value} onChange={props.onChange} />
+      </div>
+    </div>
+  );
+}
+
+function SettingFieldPanel(props: {
+  field: SettingsField;
+  value: unknown;
+  error?: string;
+  groupScope: string | null;
+  resolvedTheme: string;
+  onChange: (value: unknown) => void;
+}) {
+  const showScopeChip = props.field.show_apply_scope || !props.groupScope || props.groupScope !== props.field.apply_scope;
+  return (
+    <section className={`panel inset settings-complex-field ${props.field.dangerous ? "danger-zone" : ""}`.trim()}>
       <div className="settings-field-header">
         <div>
           <h4>{props.field.label}</h4>
-          {props.field.description && <p className="muted">{props.field.description}</p>}
+          {props.field.help_text ? <p className="muted">{props.field.help_text}</p> : props.field.description ? <p className="muted">{props.field.description}</p> : null}
         </div>
         <div className="badge-row">
-          <StatusChip tone="neutral">{props.field.apply_scope}</StatusChip>
+          {showScopeChip && <StatusChip tone="neutral">{props.field.apply_scope}</StatusChip>}
           {props.field.key === "theme" && <StatusChip tone="neutral">Resolved: {props.resolvedTheme}</StatusChip>}
         </div>
       </div>
@@ -301,10 +535,16 @@ function SettingEditor(props: { field: SettingsField; value: unknown; onChange: 
   const { field, value, onChange } = props;
   if (field.editor === "toggle") {
     return (
-      <label className="checkbox">
-        <input type="checkbox" checked={Boolean(value)} onChange={(event) => onChange(event.target.checked)} />
-        <span>Enabled</span>
-      </label>
+      <button
+        type="button"
+        role="switch"
+        aria-checked={Boolean(value)}
+        className={`settings-toggle ${Boolean(value) ? "on" : ""}`.trim()}
+        onClick={() => onChange(!Boolean(value))}
+      >
+        <span className="settings-toggle-track" />
+        <span>{Boolean(value) ? "Enabled" : "Disabled"}</span>
+      </button>
     );
   }
   if (field.editor === "select") {
@@ -320,14 +560,18 @@ function SettingEditor(props: { field: SettingsField; value: unknown; onChange: 
   }
   if (field.editor === "number") {
     return (
-      <input
-        type="number"
-        min={typeof field.validation.min === "number" ? field.validation.min : undefined}
-        max={typeof field.validation.max === "number" ? field.validation.max : undefined}
-        step={typeof field.validation.step === "number" ? field.validation.step : field.value_type === "float" ? 0.1 : 1}
-        value={typeof value === "number" || typeof value === "string" ? value : ""}
-        onChange={(event) => onChange(event.target.value)}
-      />
+      <div className={`settings-control-shell ${field.unit ? "with-unit" : ""}`.trim()}>
+        <input
+          type="number"
+          min={typeof field.validation.min === "number" ? field.validation.min : undefined}
+          max={typeof field.validation.max === "number" ? field.validation.max : undefined}
+          step={typeof field.validation.step === "number" ? field.validation.step : field.value_type === "float" ? 0.1 : 1}
+          value={typeof value === "number" || typeof value === "string" ? value : ""}
+          placeholder={field.placeholder}
+          onChange={(event) => onChange(event.target.value)}
+        />
+        {field.unit && <span className="settings-control-unit">{field.unit}</span>}
+      </div>
     );
   }
   if (field.editor === "tag_list") {
@@ -342,7 +586,7 @@ function SettingEditor(props: { field: SettingsField; value: unknown; onChange: 
   if (field.editor === "pair_list") {
     return <PairListEditor items={asPairList(value)} onChange={onChange} labels={asStringList(field.validation.pair_labels)} />;
   }
-  return <input value={typeof value === "string" || typeof value === "number" ? String(value) : ""} onChange={(event) => onChange(event.target.value)} />;
+  return <input value={typeof value === "string" || typeof value === "number" ? String(value) : ""} placeholder={field.placeholder} onChange={(event) => onChange(event.target.value)} />;
 }
 
 function StringListEditor(props: { items: string[]; onChange: (value: unknown) => void; ordered: boolean }) {
@@ -361,7 +605,9 @@ function StringListEditor(props: { items: string[]; onChange: (value: unknown) =
     <div className="settings-list-editor">
       <div className="settings-inline-input">
         <input value={draft} onChange={(event) => setDraft(event.target.value)} placeholder="Add item" />
-        <button type="button" onClick={addItem}>Add</button>
+        <button type="button" onClick={addItem}>
+          Add
+        </button>
       </div>
       <div className="settings-chip-list">
         {props.items.map((item, index) => (
@@ -369,8 +615,12 @@ function StringListEditor(props: { items: string[]; onChange: (value: unknown) =
             <span className="settings-chip">{item}</span>
             {props.ordered && (
               <>
-                <button type="button" onClick={() => props.onChange(moveArrayItem(props.items, index, index - 1))} disabled={index === 0}>Up</button>
-                <button type="button" onClick={() => props.onChange(moveArrayItem(props.items, index, index + 1))} disabled={index === props.items.length - 1}>Down</button>
+                <button type="button" onClick={() => props.onChange(moveArrayItem(props.items, index, index - 1))} disabled={index === 0}>
+                  Up
+                </button>
+                <button type="button" onClick={() => props.onChange(moveArrayItem(props.items, index, index + 1))} disabled={index === props.items.length - 1}>
+                  Down
+                </button>
               </>
             )}
             <button type="button" className="danger ghost" onClick={() => props.onChange(props.items.filter((_, itemIndex) => itemIndex !== index))}>
@@ -407,7 +657,6 @@ function KeyValueEditor(props: { field: SettingsField; value: Record<string, unk
     </div>
   );
 }
-
 function PairListEditor(props: { items: Array<[number | string, number | string]>; onChange: (value: unknown) => void; labels: string[] }) {
   const leftLabel = props.labels[0] ?? "Value A";
   const rightLabel = props.labels[1] ?? "Value B";
@@ -428,8 +677,64 @@ function PairListEditor(props: { items: Array<[number | string, number | string]
           </button>
         </div>
       ))}
-      <button type="button" onClick={() => props.onChange([...props.items, ["", ""]])}>Add Row</button>
+      <button type="button" onClick={() => props.onChange([...props.items, ["", ""]])}>
+        Add Row
+      </button>
     </div>
+  );
+}
+
+function UnknownSettingsView(props: { unknownSettings: UnknownSetting[] }) {
+  return (
+    <DashboardPanel
+      className="settings-workspace-panel"
+      title="Unknown / Unsupported"
+      subtitle="These app-setting keys are preserved exactly as stored, but they do not yet have first-class controls."
+    >
+      <div className="settings-workspace-stack">
+        {props.unknownSettings.length === 0 ? (
+          <p className="muted">No unsupported app settings are currently stored.</p>
+        ) : (
+          <div className="unknown-settings-list">
+            {props.unknownSettings.map((item) => (
+              <UnknownSettingCard key={item.key} item={item} />
+            ))}
+          </div>
+        )}
+      </div>
+    </DashboardPanel>
+  );
+}
+
+function BackupRestoreView(props: {
+  importText: string;
+  onImportTextChange: (value: string) => void;
+  onImportFile: (event: ChangeEvent<HTMLInputElement>) => void;
+  onExport: () => void;
+  onImport: () => void;
+}) {
+  return (
+    <DashboardPanel
+      className="settings-workspace-panel"
+      title="Backup / Restore"
+      subtitle="Export a full bundle or import one after stopping live sessions. Imports are full-bundle replacements."
+    >
+      <div className="settings-workspace-stack">
+        <div className="settings-warning">Importing a bundle replaces the stored settings snapshot. Use it for portability or restore flows, not everyday editing.</div>
+        <div className="button-row">
+          <button className="primary" type="button" onClick={props.onExport}>
+            Export Backup
+          </button>
+        </div>
+        <input type="file" accept="application/json" onChange={props.onImportFile} />
+        <textarea className="code-block" value={props.importText} onChange={(event) => props.onImportTextChange(event.target.value)} placeholder="Paste exported JSON here" />
+        <div className="button-row">
+          <button className="primary" type="button" disabled={!props.importText.trim()} onClick={props.onImport}>
+            Import Backup
+          </button>
+        </div>
+      </div>
+    </DashboardPanel>
   );
 }
 
@@ -448,14 +753,79 @@ function UnknownSettingCard(props: { item: UnknownSetting }) {
   );
 }
 
+function getSectionGroups(section: SettingsSection): SettingsGroup[] {
+  if (Array.isArray(section.groups) && section.groups.length > 0) return section.groups;
+  return [
+    {
+      id: `${section.id}.legacy`,
+      title: "Section Settings",
+      description: "This section is being rendered from the older flat schema payload.",
+      fields: section.fields ?? [],
+      layout_hint: "rows",
+      default_collapsed: false,
+      dangerous: Boolean(section.dangerous)
+    }
+  ];
+}
+
 function readFieldErrors(error: unknown): FieldError[] {
   if (!error || typeof error !== "object" || !("fieldErrors" in error)) return [];
   const value = (error as { fieldErrors?: unknown }).fieldErrors;
   return Array.isArray(value) ? (value as FieldError[]) : [];
 }
 
-function scrollToSettingsSection(sectionId: string) {
-  document.getElementById(`settings-${sectionId}`)?.scrollIntoView({ behavior: "smooth", block: "start" });
+function isSimpleField(field: SettingsField): boolean {
+  return SIMPLE_FIELD_EDITORS.has(field.editor) && field.layout_hint !== "panel";
+}
+
+function getControlWidth(field: SettingsField): string {
+  if (field.control_width) return field.control_width;
+  if (field.editor === "toggle") return "sm";
+  if (field.editor === "number") return "xs";
+  if (field.editor === "select") return "md";
+  return "lg";
+}
+
+function makeGroupStateKey(sectionId: string, groupId: string): string {
+  return `${sectionId}.${groupId}`;
+}
+
+function setActiveSettingsView(viewId: SettingsViewId, setActiveViewId: (value: SettingsViewId) => void) {
+  setActiveViewId(viewId);
+}
+
+function isValidSettingsViewId(viewId: string, sections: SettingsSection[]): boolean {
+  return sections.some((section) => section.id === viewId) || UTILITY_VIEWS.some((view) => view.id === viewId);
+}
+
+function getPreferredSettingsView(sections: SettingsSection[]): SettingsViewId {
+  const hashView = readHashViewId();
+  if (hashView && isValidSettingsViewId(hashView, sections)) return hashView;
+  if (typeof window !== "undefined") {
+    const stored = window.localStorage.getItem(SETTINGS_VIEW_STORAGE_KEY);
+    if (stored && isValidSettingsViewId(stored, sections)) return stored;
+  }
+  return sections.find((section) => section.id === "appearance")?.id ?? sections[0]?.id ?? "appearance";
+}
+
+function persistSettingsView(viewId: SettingsViewId) {
+  if (typeof window === "undefined") return;
+  window.localStorage.setItem(SETTINGS_VIEW_STORAGE_KEY, viewId);
+  const nextHash = `${SETTINGS_HASH_PREFIX}${viewId}`;
+  if (window.location.hash !== nextHash) {
+    window.history.replaceState(null, "", `${window.location.pathname}${window.location.search}${nextHash}`);
+  }
+}
+
+function readHashViewId(): string | null {
+  if (typeof window === "undefined") return null;
+  const { hash } = window.location;
+  if (!hash.startsWith(SETTINGS_HASH_PREFIX)) return null;
+  return hash.slice(SETTINGS_HASH_PREFIX.length) || null;
+}
+
+function uniq(values: string[]): string[] {
+  return Array.from(new Set(values.filter(Boolean)));
 }
 
 function moveArrayItem(items: string[], fromIndex: number, toIndex: number): string[] {
