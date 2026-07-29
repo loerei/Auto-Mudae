@@ -13,10 +13,11 @@ def test_claim_tracker_recording(tmp_path):
 
 def test_dashboard_renderer_lifecycle():
     renderer = DashboardRenderer(enabled=False)
-    renderer.set_status("TESTING")
-    renderer.add_roll("Emilia", 200)
+    renderer.resolve_renderer_mode(force_clear=True)
+    renderer.calculate_power_stats(100, 40, True)
     renderer.start_watcher()
     renderer.stop_watcher()
+
 
 def test_session_messaging_context(tmp_path):
     last_seen_file = str(tmp_path / "test_last_seen.json")
