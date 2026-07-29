@@ -4,9 +4,13 @@ Forked from GDiazFentanes.
 
 This repository contains a Windows-first Mudae automation workspace with the main roll bot plus Ouro side modes. The public repo is `.env`-first: sensitive account data stays in local files that are not tracked.
 
+> [!WARNING]
+> **Account Safety & Terms of Service Disclaimer**
+> Using self-bots or automating user account tokens violates Discord's Terms of Service and may result in account flags, strikes, or permanent suspension. Using official Discord Bot accounts/tokens is strongly recommended wherever possible. Use this tool entirely at your own risk.
+
 ## Quick Start
 
-1. Run `setup.bat` to create or reuse `.venv` and install `config/requirements.txt`.
+1. Run `legacy_bat/setup.bat` to create or reuse `.venv` and install `config/requirements.txt`.
 2. Make sure `node` and `npm` are installed locally so the WebUI can build.
 3. Copy `.env.example` to `.env`.
 4. Fill in `CHANNEL_ID`, `SERVER_ID`, and `TOKENS_JSON` with your own values.
