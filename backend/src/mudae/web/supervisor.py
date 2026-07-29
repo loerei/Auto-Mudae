@@ -16,6 +16,8 @@ from mudae.storage.atomic import atomic_write_json
 from mudae.web.bridge import EVENT_PREFIX
 from mudae.web.config import normalize_ui_settings, worker_paths
 from mudae.web.db import WebDB
+from mudae.web.worker_bridge import BaseWorkerBridge, SubprocessWorkerBridge
+
 
 
 SUPPORTED_MODES = {"main", "oh", "oc", "oq"}
@@ -65,13 +67,16 @@ class WorkerHandle:
 
 
 class WebSupervisor:
-    def __init__(self, db: WebDB) -> None:
+    def __init__(self, db: WebDB, bridge: Optional[BaseWorkerBridge] = None) -> None:
         self.db = db
+        self.bridge = bridge or SubprocessWorkerBridge()
         self.hub = EventHub()
         self._lock = threading.RLock()
         self._workers: Dict[int, WorkerHandle] = {}
         self._shutdown = threading.Event()
         self._background_threads: List[threading.Thread] = []
+
+
 
     def start(self) -> None:
         scheduler = threading.Thread(target=self._scheduler_loop, name="mudae-web-scheduler", daemon=True)
