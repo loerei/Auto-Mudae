@@ -14,3 +14,11 @@
 {"ts":"2026-07-30 02:22:11","ts_epoch":1785352931.7201245,"event":"tier_change","from_tier":"aggressive","to_tier":"balanced","reason":"auto_downgrade_aggressive_to_balanced"}
 {"ts":"2026-07-30 02:22:11","ts_epoch":1785352931.7201245,"event":"tier_change","from_tier":"balanced","to_tier":"legacy","reason":"auto_downgrade_balanced_to_legacy"}
 {"ts":"2026-07-30 02:22:11","ts_epoch":1785352931.7211838,"event":"tier_change","from_tier":"aggressive","to_tier":"legacy","reason":"config_update"}
+{"ts":"1970-01-01 07:16:40","ts_epoch":1000.0,"event":"tier_change","from_tier":"aggressive","to_tier":"balanced","reason":"auto_downgrade_aggressive_to_balanced"}
+{"ts":"1970-01-01 07:16:40","ts_epoch":1000.0,"event":"tier_change","from_tier":"balanced","to_tier":"legacy","reason":"auto_downgrade_balanced_to_legacy"}
+{"ts":"1970-01-01 07:18:50","ts_epoch":1130.0,"event":"tier_change","from_tier":"legacy","to_tier":"balanced","reason":"auto_recover_legacy_to_balanced"}
+{"ts":"1970-01-01 07:21:00","ts_epoch":1260.0,"event":"tier_change","from_tier":"balanced","to_tier":"aggressive","reason":"auto_recover_balanced_to_aggressive"}
+{"ts":"2026-07-30 02:24:35","ts_epoch":1785353075.6973944,"event":"tier_change","from_tier":"aggressive","to_tier":"legacy","reason":"config_update"}
+{"ts":"2026-07-30 02:24:35","ts_epoch":1785353075.6985254,"event":"tier_change","from_tier":"aggressive","to_tier":"balanced","reason":"auto_downgrade_aggressive_to_balanced"}
+{"ts":"2026-07-30 02:24:35","ts_epoch":1785353075.6985254,"event":"tier_change","from_tier":"balanced","to_tier":"legacy","reason":"auto_downgrade_balanced_to_legacy"}
+{"ts":"2026-07-30 02:24:35","ts_epoch":1785353075.6990552,"event":"tier_change","from_tier":"aggressive","to_tier":"legacy","reason":"config_update"}
