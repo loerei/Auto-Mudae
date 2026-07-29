@@ -446,7 +446,9 @@ def main() -> None:
     ui_settings = normalize_ui_settings(db.get_settings("ui_settings", DEFAULT_UI_SETTINGS))
     host = str(ui_settings.get("bind_host") or DEFAULT_UI_SETTINGS["bind_host"])
     port = int(ui_settings.get("bind_port") or DEFAULT_UI_SETTINGS["bind_port"])
-    server = uvicorn.Server(uvicorn.Config(app, host=host, port=port, reload=False))
+    reload_enabled = os.getenv("WEBUI_RELOAD", "0").lower() in ("1", "true", "yes")
+    app_target = "mudae.web.server:app" if reload_enabled else app
+    server = uvicorn.Server(uvicorn.Config(app_target, host=host, port=port, reload=reload_enabled))
     _uvicorn_server = server
     server.run()
 
