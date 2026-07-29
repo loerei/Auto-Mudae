@@ -24,8 +24,8 @@ logs/*
 !logs/.gitkeep
 
 .cache
-webui/node_modules/
-webui/dist/
+frontend/node_modules/
+frontend/dist/
 *.db
 *.sqlite3
 
