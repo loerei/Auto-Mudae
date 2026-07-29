@@ -5,9 +5,8 @@ common_bot.py - Common helper functions shared across Ouro bot runners (Oh_bot, 
 import json
 import re
 import time
-from typing import Any, Dict, List, Optional, Tuple
-
 import requests
+from typing import Any, Dict, List, Optional, Tuple
 
 from mudae.config import vars as Vars
 from mudae.core import latency as Latency
@@ -23,6 +22,15 @@ ACTION_LEASE_HEARTBEAT_SEC = 20.0
 
 def _timestamp() -> str:
     return time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())
+
+
+def message_url(channel_id: Optional[str] = None) -> str:
+    c_id = channel_id or Vars.channelId
+    return f"{Vars.DISCORD_API_BASE}/{Vars.DISCORD_API_VERSION_MESSAGES}/channels/{c_id}/messages"
+
+
+def base_url() -> str:
+    return f"{Vars.DISCORD_API_BASE}/{Vars.DISCORD_API_VERSION_MESSAGES}"
 
 
 def message_lag_ms(message: Optional[Dict[str, Any]]) -> Optional[int]:
@@ -210,3 +218,16 @@ def fetch_reward_messages(url: str, auth: Dict[str, str], limit: int = 15) -> Li
     except Exception:
         pass
     return []
+
+
+def message_hash(message: Dict[str, Any]) -> str:
+    try:
+        payload = {
+            "content": message.get("content", ""),
+            "components": message.get("components", []),
+            "embeds": message.get("embeds", []),
+            "edited_timestamp": message.get("edited_timestamp"),
+        }
+        return json.dumps(payload, sort_keys=True, separators=(",", ":"))
+    except Exception:
+        return str(message.get("id", ""))

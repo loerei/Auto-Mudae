@@ -59,26 +59,7 @@ INPUT_MAP = {
 }
 
 
-def _env_int(name: str, default: int) -> int:
-    raw = os.getenv(name)
-    if raw is None:
-        return int(default)
-    try:
-        value = int(raw.strip())
-        return value if value > 0 else int(default)
-    except Exception:
-        return int(default)
-
-
-def _env_float(name: str, default: float) -> float:
-    raw = os.getenv(name)
-    if raw is None:
-        return float(default)
-    try:
-        value = float(raw.strip())
-        return value if value > 0 else float(default)
-    except Exception:
-        return float(default)
+from mudae.ouro.Oq_solver import _env_int, _env_float
 
 
 def _render_cache_build_progress(progress: Dict[str, Any]) -> None:

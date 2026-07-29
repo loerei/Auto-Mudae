@@ -5,6 +5,7 @@ import random
 import time
 import requests
 from mudae.core import latency as Latency
+from mudae.ouro.common_bot import message_hash as _message_hash
 
 DEFAULT_TIMEOUT_SEC = 12.0
 MAX_LIMIT = 100
@@ -511,19 +512,6 @@ def wait_for_author_message(
         if _sleep_with_stop(_attempt_delay(attempt_index, delay_sec, schedule), stop_check):
             return last_response, last_messages, None
     return last_response, last_messages, None
-
-
-def _message_hash(message: Dict[str, Any]) -> str:
-    try:
-        payload = {
-            "content": message.get("content", ""),
-            "components": message.get("components", []),
-            "embeds": message.get("embeds", []),
-            "edited_timestamp": message.get("edited_timestamp"),
-        }
-        return json.dumps(payload, sort_keys=True, separators=(",", ":"))
-    except Exception:
-        return str(message.get("id", ""))
 
 
 def fetch_message_by_id(

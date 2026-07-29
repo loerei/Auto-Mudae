@@ -135,9 +135,7 @@ def _log_load_info(label: str, message: str):
         pass
 
 
-def _build_likelihoods_exact():
-    """Build exact P(obs_color | red_pos, click_pos) by enumeration."""
-    start = time.perf_counter()
+def build_exact_oc_likelihoods() -> Dict[Tuple[int, int], Dict[Tuple[int, int], Dict[SphereColor, float]]]:
     likelihood = {click: {red: {col: 0 for col in SphereColor} for red in VALID_POSITIONS} for click in ALL_POSITIONS}
 
     def get_adjacent(r0, c0):
@@ -211,6 +209,52 @@ def _build_likelihoods_exact():
             for col in counts:
                 counts[col] = counts[col] / total
 
+    return likelihood
+
+
+def compute_ev_lookahead(
+    unrevealed: List[Tuple[int, int]],
+    prior: Dict[Tuple[int, int], float],
+    likelihoods: Dict[Tuple[int, int], Dict[Tuple[int, int], Dict[SphereColor, float]]],
+) -> Tuple[float, Optional[Tuple[int, int]]]:
+    best_ev = -1.0
+    best_pos = None
+
+    for pos in unrevealed:
+        immediate = prior.get(pos, 0.0)
+
+        obs_probs = {col: 0.0 for col in SphereColor}
+        for rp, p in prior.items():
+            for col, prob in likelihoods[pos][rp].items():
+                obs_probs[col] += p * prob
+
+        expected_next = 0.0
+        for o, P_o in obs_probs.items():
+            if P_o == 0 or o == SphereColor.RED:
+                continue
+            posterior_o = {}
+            s = 0.0
+            for rp, p in prior.items():
+                like = likelihoods[pos][rp].get(o, 0.0)
+                if like > 0:
+                    posterior_o[rp] = p * like
+                    s += posterior_o[rp]
+            if s == 0:
+                continue
+            for rp in posterior_o:
+                posterior_o[rp] /= s
+            best_next = max(posterior_o.values()) if posterior_o else 0.0
+            expected_next += P_o * best_next
+
+        ev = immediate + expected_next
+        if ev > best_ev:
+            best_ev = ev
+            best_pos = pos
+
+    return best_ev, best_pos
+    """Build exact P(obs_color | red_pos, click_pos) by enumeration."""
+    start = time.perf_counter()
+    likelihood = build_exact_oc_likelihoods()
     elapsed = time.perf_counter() - start
     print(f"[INFO] Built exact likelihoods in {elapsed:.1f}s")
     _log_load_timing("build_likelihoods_exact", elapsed)
@@ -977,41 +1021,7 @@ class InteractiveSolver:
             return _ret(best_rp)
 
         unrevealed = [(r, c) for r, c in ALL_POSITIONS if not self.revealed[r][c]]
-        best_ev = -1.0
-        best_pos = None
-
-        for pos in unrevealed:
-            immediate = self.prior.get(pos, 0.0)
-
-            # compute observation distribution at pos
-            obs_probs = {col: 0.0 for col in SphereColor}
-            for rp, p in self.prior.items():
-                for col, prob in self.likelihoods[pos][rp].items():
-                    obs_probs[col] += p * prob
-
-            expected_next = 0.0
-            for o, P_o in obs_probs.items():
-                if P_o == 0 or o == SphereColor.RED:
-                    continue
-                # posterior given o
-                posterior_o = {}
-                s = 0.0
-                for rp, p in self.prior.items():
-                    like = self.likelihoods[pos][rp].get(o, 0.0)
-                    if like > 0:
-                        posterior_o[rp] = p * like
-                        s += posterior_o[rp]
-                if s == 0:
-                    continue
-                for rp in posterior_o:
-                    posterior_o[rp] /= s
-                best_next = max(posterior_o.values()) if posterior_o else 0.0
-                expected_next += P_o * best_next
-
-            ev = immediate + expected_next
-            if ev > best_ev:
-                best_ev = ev
-                best_pos = pos
+        best_ev, best_pos = compute_ev_lookahead(unrevealed, self.prior, self.likelihoods)
 
         if best_pos is None:
             # fallback choose unrevealed with highest prior

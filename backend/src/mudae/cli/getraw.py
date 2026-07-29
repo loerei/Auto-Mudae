@@ -50,31 +50,9 @@ def getResultFilePath() -> str:
 def logRawResponse(label: str, response_data: Any) -> None:
     """Log raw Discord API response to Getrawresult.json file"""
     try:
+        from mudae.core.session_engine import _build_raw_response_entry
         result_file = getResultFilePath()
-        timestamp = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())
-        entry: Dict[str, Any] = {
-            'ts': timestamp,
-            'label': label,
-            'source': 'Getraw.logRawResponse'
-        }
-        if isinstance(response_data, requests.Response):
-            entry['type'] = 'http'
-            entry['status_code'] = response_data.status_code
-            entry['headers'] = dict(response_data.headers)
-            entry['content_type'] = response_data.headers.get('Content-Type', 'N/A')
-            entry['body_text'] = response_data.text
-            try:
-                entry['body_json'] = response_data.json()
-                entry['parse_error'] = None
-            except Exception as exc:
-                entry['body_json'] = None
-                entry['parse_error'] = str(exc)
-        else:
-            entry['type'] = 'data'
-            entry['body_text'] = str(response_data)
-            entry['body_json'] = None
-            entry['parse_error'] = None
-
+        entry = _build_raw_response_entry(label, response_data, 'Getraw.logRawResponse')
         append_json_array(result_file, entry)
         print(f"Logged: {label}")
     except Exception as e:

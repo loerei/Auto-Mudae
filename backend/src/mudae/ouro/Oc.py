@@ -55,87 +55,8 @@ def _build_likelihoods_exact() -> Dict:
     Build exact likelihoods P(obs_color | red_pos, click_pos) by enumeration.
     """
     start = time.time()
-    likelihood = {}
-    
-    # Initialize for all positions (can click center, but RED never spawns there)
-    for click in ALL_POSITIONS:
-        likelihood[click] = {}
-        for red in VALID_POSITIONS:
-            likelihood[click][red] = {col: 0 for col in SphereColor}
-    
-    def get_adjacent(r0, c0):
-        adj = []
-        for dr, dc in [(-1,0), (1,0), (0,-1), (0,1)]:
-            nr, nc = r0+dr, c0+dc
-            if 0 <= nr < 5 and 0 <= nc < 5:
-                adj.append((nr,nc))
-        return adj
-    
-    def get_diagonal(r0, c0):
-        diag = []
-        for dr, dc in [(-1, -1), (-1, 1), (1, -1), (1, 1)]:
-            nr, nc = r0 + dr, c0 + dc
-            while 0 <= nr < 5 and 0 <= nc < 5:
-                diag.append((nr, nc))
-                nr += dr
-                nc += dc
-        return diag
-    
-    def get_row_col(r0, c0):
-        positions = []
-        for i in range(5):
-            if i != c0:
-                positions.append((r0, i))
-            if i != r0:
-                positions.append((i, c0))
-        return positions
-
-    boards_per_red = {red: 0 for red in VALID_POSITIONS}
-
-    # Enumerate all valid boards for each RED position
-    for red in VALID_POSITIONS:
-        r, c = red
-        orange_positions = get_adjacent(r, c)
-        yellow_positions = get_diagonal(r, c)
-        row_col_positions = get_row_col(r, c)
-        row_col_set = set(row_col_positions)
-        diag_set = set(yellow_positions)
-
-        for oranges in combinations(orange_positions, 2):
-            orange_set = set(oranges)
-            for yellows in combinations(yellow_positions, 3):
-                yellow_set = set(yellows)
-                green_candidates = [pos for pos in row_col_positions if pos not in orange_set]
-                for greens in combinations(green_candidates, 4):
-                    green_set = set(greens)
-                    teal_set = (row_col_set | diag_set) - orange_set - yellow_set - green_set - {red}
-
-                    boards_per_red[red] += 1
-                    for click_pos in ALL_POSITIONS:
-                        if click_pos == red:
-                            color = SphereColor.RED
-                        elif click_pos in orange_set:
-                            color = SphereColor.ORANGE
-                        elif click_pos in yellow_set:
-                            color = SphereColor.YELLOW
-                        elif click_pos in green_set:
-                            color = SphereColor.GREEN
-                        elif click_pos in teal_set:
-                            color = SphereColor.TEAL
-                        else:
-                            color = SphereColor.BLUE
-                        likelihood[click_pos][red][color] += 1
-    
-    # Normalize to probabilities
-    for click in ALL_POSITIONS:
-        for red in VALID_POSITIONS:
-            total = boards_per_red[red]
-            if total == 0:
-                continue
-            counts = likelihood[click][red]
-            for col in list(counts.keys()):
-                counts[col] = counts[col] / total
-    
+    from mudae.ouro.Oc_interactive_solver import build_exact_oc_likelihoods
+    likelihood = build_exact_oc_likelihoods()
     elapsed = time.time() - start
     print(f"[OC] Built exact likelihoods in {elapsed:.1f}s")
     return likelihood
@@ -615,50 +536,8 @@ class OcSolver:
         
         # Otherwise, use EV lookahead
         unrevealed = self.game.get_unrevealed_positions()
-        best_ev = -1.0
-        best_pos = None
-        
-        for pos in unrevealed:
-            # Immediate value: probability RED is at this position
-            immediate = self.prior.get(pos, 0.0)
-            
-            # Expected value after this click: best we can do in next state
-            # For each possible observation outcome:
-            obs_probs = {col: 0.0 for col in SphereColor}
-            for rp, p in self.prior.items():
-                for col, prob in self.likelihoods[pos][rp].items():
-                    obs_probs[col] += p * prob
-            
-            expected_next = 0.0
-            for o, P_o in obs_probs.items():
-                if P_o == 0 or o == SphereColor.RED:
-                    continue
-                
-                # Posterior distribution given this observation
-                posterior_o = {}
-                s = 0.0
-                for rp, p in self.prior.items():
-                    like = self.likelihoods[pos][rp].get(o, 0.0)
-                    if like > 0:
-                        posterior_o[rp] = p * like
-                        s += posterior_o[rp]
-                
-                if s == 0:
-                    continue
-                
-                for rp in posterior_o:
-                    posterior_o[rp] /= s
-                
-                # Best probability we can achieve in next state
-                best_next = max(posterior_o.values()) if posterior_o else 0.0
-                expected_next += P_o * best_next
-            
-            # Combined EV: immediate success + expected next success
-            ev = immediate + expected_next
-            
-            if ev > best_ev:
-                best_ev = ev
-                best_pos = pos
+        from mudae.ouro.Oc_interactive_solver import compute_ev_lookahead
+        best_ev, best_pos = compute_ev_lookahead(unrevealed, self.prior, self.likelihoods)
         
         if best_pos is None:
             # Fallback: click position with highest probability

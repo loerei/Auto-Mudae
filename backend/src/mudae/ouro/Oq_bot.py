@@ -39,19 +39,21 @@ from mudae.ouro.Oq_solver import (
 )
 from mudae.web.bridge import emit_log, emit_runner_event
 from mudae.ouro.common_bot import (
-    message_lag_ms,
+    message_lag_ms as _message_lag_ms,
     emit_bot_latency,
-    poll_delay,
-    post_action_pause,
-    acquire_action_lease,
-    select_user,
-    parse_clicks_and_time,
-    safe_response_json,
-    truncate_text,
-    serialize_full_response,
-    extract_error_fields,
-    log_refresh_error,
+    poll_delay as _poll_delay,
+    post_action_pause as _post_action_pause,
+    acquire_action_lease as _acquire_action_lease,
+    select_user as _select_user,
+    parse_clicks_and_time as _parse_clicks_and_time,
+    safe_response_json as _safe_response_json,
+    truncate_text as _truncate_text,
+    serialize_full_response as _serialize_full_response,
+    extract_error_fields as _extract_error_fields,
+    log_refresh_error as _log_refresh_error,
     fetch_reward_messages,
+    message_url as _message_url,
+    base_url as _base_url,
 )
 
 try:
@@ -124,41 +126,8 @@ def _timestamp() -> str:
     return time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())
 
 
-def _message_lag_ms(message: Optional[Dict[str, Any]]) -> Optional[int]:
-    return message_lag_ms(message)
-
-
 def _emit_latency(event: str, **fields: Any) -> None:
     emit_bot_latency("oq", event, **fields)
-
-
-def _poll_delay(
-    attempt_index: int,
-    delay_sec: float,
-    schedule: Optional[List[float]],
-    *,
-    legacy_scale: float,
-    legacy_cap: float,
-) -> float:
-    return poll_delay(
-        attempt_index,
-        delay_sec,
-        schedule,
-        legacy_scale=legacy_scale,
-        legacy_cap=legacy_cap,
-    )
-
-
-def _post_action_pause(default_sec: float) -> None:
-    post_action_pause(default_sec)
-
-
-def _message_url() -> str:
-    return f"{Vars.DISCORD_API_BASE}/{Vars.DISCORD_API_VERSION_MESSAGES}/channels/{Vars.channelId}/messages"
-
-
-def _base_url() -> str:
-    return f"{Vars.DISCORD_API_BASE}/{Vars.DISCORD_API_VERSION_MESSAGES}"
 
 
 def _log_event(entry: Dict[str, Any]) -> None:
@@ -167,10 +136,6 @@ def _log_event(entry: Dict[str, Any]) -> None:
     payload["ts"] = _timestamp()
     append_json_array(LOG_FILE, payload)
     emit_runner_event("Oq_bot", payload)
-
-
-def _select_user() -> Dict[str, str]:
-    return select_user()
 
 
 def _parse_clicks_and_time(content: str, default_clicks: int, default_time_sec: int) -> Tuple[int, int]:

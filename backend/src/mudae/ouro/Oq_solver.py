@@ -758,6 +758,30 @@ def _save_first_suggestion(max_clicks: int, cache_version: str, policy_signature
         pass
 
 
+def _check_terminal_state(
+    cache: OqStateCache,
+    key: StateKey,
+    possible_mask: int,
+    found_purples: int,
+    clicks_left: int,
+    state_progress_callback: Optional[StateProgressCallback] = None,
+) -> Tuple[bool, float]:
+    cached = cache.get(key)
+    if cached is not None:
+        return True, cached
+    if found_purples >= TARGET_PURPLES:
+        cache.set(key, 1.0)
+        if state_progress_callback is not None:
+            state_progress_callback()
+        return True, 1.0
+    if clicks_left <= 0 or possible_mask == 0 or possible_mask.bit_count() == 0:
+        cache.set(key, 0.0)
+        if state_progress_callback is not None:
+            state_progress_callback()
+        return True, 0.0
+    return False, 0.0
+
+
 def _best_success_prob_exact(
     cache: OqStateCache,
     possible_mask: int,
@@ -767,32 +791,11 @@ def _best_success_prob_exact(
     state_progress_callback: Optional[StateProgressCallback] = None,
 ) -> float:
     key: StateKey = (possible_mask, revealed_mask, found_purples, clicks_left)
-    cached = cache.get(key)
-    if cached is not None:
-        return cached
-
-    if found_purples >= TARGET_PURPLES:
-        cache.set(key, 1.0)
-        if state_progress_callback is not None:
-            state_progress_callback()
-        return 1.0
-    if clicks_left <= 0:
-        cache.set(key, 0.0)
-        if state_progress_callback is not None:
-            state_progress_callback()
-        return 0.0
-    if possible_mask == 0:
-        cache.set(key, 0.0)
-        if state_progress_callback is not None:
-            state_progress_callback()
-        return 0.0
+    is_terminal, val = _check_terminal_state(cache, key, possible_mask, found_purples, clicks_left, state_progress_callback)
+    if is_terminal:
+        return val
 
     total = possible_mask.bit_count()
-    if total == 0:
-        cache.set(key, 0.0)
-        if state_progress_callback is not None:
-            state_progress_callback()
-        return 0.0
 
     best_val = 0.0
     for pos in POSITIONS:
@@ -884,32 +887,11 @@ def _best_success_prob_beam(
     state_progress_callback: Optional[StateProgressCallback] = None,
 ) -> float:
     key: StateKey = (possible_mask, revealed_mask, found_purples, clicks_left)
-    cached = cache.get(key)
-    if cached is not None:
-        return cached
-
-    if found_purples >= TARGET_PURPLES:
-        cache.set(key, 1.0)
-        if state_progress_callback is not None:
-            state_progress_callback()
-        return 1.0
-    if clicks_left <= 0:
-        cache.set(key, 0.0)
-        if state_progress_callback is not None:
-            state_progress_callback()
-        return 0.0
-    if possible_mask == 0:
-        cache.set(key, 0.0)
-        if state_progress_callback is not None:
-            state_progress_callback()
-        return 0.0
+    is_terminal, val = _check_terminal_state(cache, key, possible_mask, found_purples, clicks_left, state_progress_callback)
+    if is_terminal:
+        return val
 
     total = possible_mask.bit_count()
-    if total == 0:
-        cache.set(key, 0.0)
-        if state_progress_callback is not None:
-            state_progress_callback()
-        return 0.0
 
     candidate_positions = _beam_candidate_positions(
         possible_mask,

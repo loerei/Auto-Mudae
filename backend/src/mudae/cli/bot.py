@@ -245,17 +245,8 @@ def main():
 
 
     def _no_reset_retry_delay_seconds(failures: int) -> int:
-        attempts = max(1, int(failures))
-        base_delay = min(300, 30 * (2 ** (attempts - 1)))
-        try:
-            jitter_pct = float(getattr(Vars, "NO_RESET_RETRY_JITTER_PCT", 0.15) or 0.15)
-        except (TypeError, ValueError):
-            jitter_pct = 0.15
-        jitter_pct = max(0.0, min(0.15, jitter_pct))
-        if base_delay <= 0 or jitter_pct <= 0:
-            return base_delay
-        jittered = int(round(base_delay * (1.0 + random.uniform(0.0, jitter_pct))))
-        return min(300, max(1, jittered))
+        from mudae.core.session_engine import no_reset_retry_delay_seconds
+        return no_reset_retry_delay_seconds(failures)
 
     def _scan_interval_bounds(remaining_sec: int) -> tuple[float, float]:
         if remaining_sec >= 60 * 30:
@@ -580,24 +571,8 @@ def main():
                     tu_retry_failures += 1
                     wait_seconds = _no_reset_retry_delay_seconds(tu_retry_failures)
                     tu_reason = getLastTuFetchReason(current_token)
-                    if tu_reason == "same_account_action_busy":
-                        retry_label = "Same-account action gate busy"
-                        log_warn(
-                            f"Same-account action gate busy, waiting {wait_seconds} seconds before retry without "
-                            f"sending extra commands (attempt {tu_retry_failures}, capped at 300 seconds)..."
-                        )
-                    elif tu_reason == "network_fail":
-                        retry_label = "Network error while refreshing /tu"
-                        log_warn(
-                            f"Network error while refreshing /tu, waiting {wait_seconds} seconds before retry "
-                            f"(attempt {tu_retry_failures}, capped at 300 seconds)..."
-                        )
-                    else:
-                        retry_label = "No fresh /tu state available"
-                        log_warn(
-                            f"No fresh /tu state available, waiting {wait_seconds} seconds before retry "
-                            f"(attempt {tu_retry_failures}, capped at 300 seconds)..."
-                        )
+                    from mudae.core.session_engine import log_tu_retry_warning
+                    retry_label = log_tu_retry_warning(tu_reason, wait_seconds, tu_retry_failures, log_warn)
                     next_action_time = _format_next_action_time(wait_seconds)
                     setDashboardState(
                         "WAITING",
