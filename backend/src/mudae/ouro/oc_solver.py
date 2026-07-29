@@ -1,21 +1,21 @@
 from mudae.ouro.base_solver import BaseOuroSolver, OuroGameState, OuroSolverResult
 
-class OhSolver(BaseOuroSolver):
+class OcSolver(BaseOuroSolver):
     """
-    Pure solver for Ouro Harvest (OH) grid calculations.
+    Pure solver for Ouro Chest (OC) combination puzzles.
     """
     def solve(self, game_state: OuroGameState) -> OuroSolverResult:
-        if game_state.mode.lower() not in ("oh", "harvest"):
+        if game_state.mode.lower() not in ("oc", "chest"):
             return OuroSolverResult(
                 success=False,
                 mode=game_state.mode,
                 error_mode="INVALID_MODE",
-                metadata={"reason": "Mode mismatch for OhSolver"}
+                metadata={"reason": "Mode mismatch for OcSolver"}
             )
-        moves = ["click_tile_0_0", "harvest_center"]
+        moves = ["unlock_combination_1", "open_chest"]
         return OuroSolverResult(
             success=True,
-            mode="oh",
+            mode="oc",
             moves=moves,
-            metadata={"tiles_processed": 2}
+            metadata={"combination_used": 1}
         )
