@@ -7,35 +7,19 @@ from mudae.config import vars as Vars
 from mudae.discord import fetch as Fetch
 from mudae.core.session_logging import log, log_warn, log_success, logRawResponse, logSessionRawResponse
 
-_last_wishlist_cache: Dict[str, Dict[str, Any]] = {}
-_last_wishlist_at: Dict[str, float] = {}
+from mudae.core.session_state import _default_session_state_engine
+
+_last_wishlist_cache: Dict[str, Dict[str, Any]] = _default_session_state_engine._last_wishlist_cache
+_last_wishlist_at: Dict[str, float] = _default_session_state_engine._last_wishlist_at
 
 def _cache_wishlist(token: str, wishlist_data: Optional[Dict[str, Any]]) -> None:
-    if not token or not wishlist_data or wishlist_data.get("status") != "success":
-        return
-    _last_wishlist_cache[token] = copy.deepcopy(wishlist_data)
-    _last_wishlist_at[token] = time.time()
+    _default_session_state_engine.cache_wishlist(token, wishlist_data)
 
 def _wishlist_cache_ttl_sec() -> float:
-    try:
-        return max(0.0, float(getattr(Vars, "WISHLIST_CACHE_TTL_SEC", 300.0) or 300.0))
-    except (TypeError, ValueError):
-        return 300.0
+    return _default_session_state_engine.wishlist_cache_ttl_sec()
 
 def _get_cached_wishlist(token: str, max_age_sec: Optional[float] = None) -> Optional[Dict[str, Any]]:
-    if not token:
-        return None
-    cached = _last_wishlist_cache.get(token)
-    if not cached:
-        return None
-    timestamp = _last_wishlist_at.get(token)
-    if max_age_sec is not None and timestamp is not None:
-        try:
-            if (time.time() - float(timestamp)) > float(max_age_sec):
-                return None
-        except (TypeError, ValueError):
-            pass
-    return copy.deepcopy(cached)
+    return _default_session_state_engine.get_cached_wishlist(token, max_age_sec)
 
 def matchesWishlist(
     cardName: str,

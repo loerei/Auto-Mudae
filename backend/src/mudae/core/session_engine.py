@@ -30,6 +30,7 @@ from mudae.parsers.time_parser import (
     _parse_discord_timestamp,
 )
 from mudae.core.session_state import SessionStateEngine, SessionAction
+from mudae.core.session_runtime import SessionRuntime, _default_session_runtime
 from mudae.core.claim_tracker import ClaimTracker
 from mudae.core.session_messaging import SessionMessageContext
 from mudae.core.session_scheduler import SessionScheduler
@@ -400,121 +401,79 @@ DASHBOARD_CLEAR = os.environ.get('MUDAE_DASHBOARD_CLEAR', '1') != '0'
 MAX_ROLLS = Vars.ROLLS_PER_RESET
 _PROGRAM_START_TS = time.time()
 
-_dashboard_state: Dict[str, Any] = {
-    'user': None,
-    'session_start': None,
-    'session_start_ts': None,
-    'program_start': time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(_PROGRAM_START_TS)),
-    'program_start_ts': _PROGRAM_START_TS,
-    'status': {},
-    'wishlist': {},
-    'rolls': [],
-    'rolls_total': 0,
-    'rolls_target': None,
-    'rolls_remaining': None,
-    'best_candidate': None,
-    'others_rolls': [],
-    'summary': {},
-    'last_message': '',
-    'predicted_status': '',
-    'predicted_at': '',
-    'countdown_active': False,
-    'countdown_total': 0,
-    'countdown_remaining': 0,
-    'countdown_status': None,
-    'connection_status': 'Connecting',
-    'connection_retry_active': False,
-    'connection_retry_sec': 0,
-    'state': 'INIT',
-    'last_action': '',
-    'next_action': '',
-}
+_dashboard_state: Dict[str, Any] = _default_session_runtime.dashboard_state
 
 def _dashboard_set_status(status: Optional[Dict[str, Any]]) -> None:
-    if status is not None:
-        _dashboard_state['status'] = status
+    _default_session_runtime.set_status(status)
 
 def _dashboard_set_wishlist(wishlist: Optional[Dict[str, Any]]) -> None:
-    if wishlist is not None:
-        _dashboard_state['wishlist'] = wishlist
+    _default_session_runtime.set_wishlist(wishlist)
 
 def _dashboard_add_roll(entry: Dict[str, Any]) -> None:
-    _dashboard_state['rolls'].append(entry)
-    from mudae.core import session_engine as Session
-    emit_state_fn = getattr(Session, "emit_state", None)
-    if emit_state_fn:
-        emit_state_fn("rolls", {"items": _dashboard_state['rolls'], "total": len(_dashboard_state['rolls'])})
+    _default_session_runtime.add_roll(entry)
 
 def _dashboard_add_other_roll(entry: Dict[str, Any]) -> None:
-    _dashboard_state['others_rolls'].append(entry)
-    from mudae.core import session_engine as Session
-    emit_state_fn = getattr(Session, "emit_state", None)
-    if emit_state_fn:
-        emit_state_fn("others_rolls", {"items": _dashboard_state['others_rolls'], "total": len(_dashboard_state['others_rolls'])})
+    _default_session_runtime.add_other_roll(entry)
 
 def _dashboard_mark_last_roll(key: str, value: Any) -> None:
-    _dashboard_state[key] = value
-    if _dashboard_state.get('rolls'):
-        _dashboard_state['rolls'][-1][key] = value
+    _default_session_runtime.mark_last_roll(key, value)
 
 def _dashboard_set_roll_progress(remaining: Optional[int], target: Optional[int]) -> None:
-    _dashboard_state['rolls_remaining'] = remaining
-    _dashboard_state['rolls_target'] = target
+    _default_session_runtime.set_roll_progress(remaining, target)
 
 def _dashboard_set_best_candidate(candidate: Optional[Dict[str, Any]]) -> None:
-    _dashboard_state['best_candidate'] = candidate
+    _default_session_runtime.set_best_candidate(candidate)
 
 def _dashboard_set_summary(summary: Dict[str, Any]) -> None:
-    _dashboard_state['summary'] = summary
+    _default_session_runtime.set_summary(summary)
 
 def _dashboard_set_predicted(status: str, minutes_to_wait: int) -> None:
-    _dashboard_state['predicted_status'] = status
+    _default_session_runtime.set_predicted(status, minutes_to_wait)
 
 def _dashboard_reset_session(session_start: Optional[str] = None) -> None:
-    pass
+    _default_session_runtime.reset_session(session_start)
 
 def _dashboard_reset_roll_state(session_start: Optional[str] = None) -> None:
-    pass
+    _default_session_runtime.reset_roll_state(session_start)
 
 def _dashboard_emit_session_meta() -> None:
-    pass
+    _default_session_runtime.emit_session_meta()
 
 def _dashboard_emit_rolls() -> None:
-    pass
+    _default_session_runtime.emit_rolls()
 
 def _dashboard_emit_other_rolls() -> None:
-    pass
+    _default_session_runtime.emit_other_rolls()
 
 def _dashboard_emit_connection_retry() -> None:
-    pass
+    _default_session_runtime.emit_connection_retry()
 
 def setConnectionStatus(status: str) -> None:
-    _dashboard_state['connection_status'] = status
+    _default_session_runtime.set_connection_status(status)
 
 def startConnectionRetry(seconds_remaining: int) -> None:
-    pass
+    _default_session_runtime.start_connection_retry(seconds_remaining)
 
 def updateConnectionRetry(seconds_remaining: int) -> None:
-    pass
+    _default_session_runtime.update_connection_retry(seconds_remaining)
 
 def stopConnectionRetry() -> None:
-    pass
+    _default_session_runtime.stop_connection_retry()
 
 def setDashboardState(state: str, last_action: Optional[str] = None, next_action: Optional[str] = None) -> None:
-    _dashboard_state['state'] = state
+    _default_session_runtime.set_dashboard_state(state, last_action, next_action)
 
 def startDashboardCountdown(status: Optional[Dict[str, Any]], total_seconds: int) -> None:
-    pass
+    _default_session_runtime.start_dashboard_countdown(status, total_seconds)
 
 def updateDashboardCountdown(seconds_remaining: int) -> None:
-    pass
+    _default_session_runtime.update_dashboard_countdown(seconds_remaining)
 
 def stopDashboardCountdown() -> None:
-    pass
+    _default_session_runtime.stop_dashboard_countdown()
 
 def render_dashboard(clear: bool = True) -> None:
-    """Render current dashboard state."""
-    pass
+    _default_session_runtime.render_dashboard(clear)
 
 def useSpecialCommand(token: str, command_name: str) -> bool:
     """Use a special command (/daily, /rolls, /dk, /rollsutil resetclaimtimer)."""
@@ -601,12 +560,4 @@ def probe_token_status(token: str) -> Optional[Dict[str, Any]]:
 
 def initializeSession(token: str, expected_username: str = "") -> None:
     """Initialize logging and seed the session with a fresh or cached /tu state."""
-    if token:
-        cached = _get_cached_tu_info(token)
-        if cached:
-            initial_tu_cache[token] = dict(cached)
-            _set_last_fetch_reason("tu", token, "cache_hit")
-        else:
-            tu = getTuInfo(token)
-            if tu:
-                initial_tu_cache[token] = dict(tu)
+    _default_session_runtime.initialize_session(token, expected_username)

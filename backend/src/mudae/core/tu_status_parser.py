@@ -6,15 +6,12 @@ from mudae.config import vars as Vars
 from mudae.parsers.time_parser import _parse_discord_timestamp, parseMudaeTime, formatTimeHrsMin
 from mudae.core.session_logging import log_warn
 
-_last_tu_info_cache: Dict[str, Dict[str, Any]] = {}
-_last_tu_info_at: Dict[str, float] = {}
-initial_tu_cache: Dict[str, Dict[str, Any]] = {}
-_last_fetch_reason: Dict[str, Dict[str, str]] = {
-    "tu": {},
-    "wl": {},
-    "report": {},
-    "special": {},
-}
+from mudae.core.session_state import _default_session_state_engine
+
+_last_tu_info_cache: Dict[str, Dict[str, Any]] = _default_session_state_engine._last_tu_info_cache
+_last_tu_info_at: Dict[str, float] = _default_session_state_engine._last_tu_info_at
+initial_tu_cache: Dict[str, Dict[str, Any]] = _default_session_state_engine._initial_tu_cache
+_last_fetch_reason: Dict[str, Dict[str, str]] = _default_session_state_engine._last_fetch_reason
 
 def getMaxPowerForToken(token: str) -> int:
     """Resolve max power for a token from Vars."""
@@ -37,81 +34,37 @@ def getMaxPowerForToken(token: str) -> int:
     return int(getattr(Vars, "MAX_POWER", 100) or 100)
 
 def _cache_tu_info(token: str, tu_info: Optional[Dict[str, Any]]) -> None:
-    if not token or not tu_info:
-        return
-    _last_tu_info_cache[token] = dict(tu_info)
-    _last_tu_info_at[token] = time.time()
+    _default_session_state_engine.cache_tu_info(token, tu_info)
 
 def _set_last_fetch_reason(kind: str, token: str, reason: Optional[str]) -> None:
-    if not kind or not token:
-        return
-    bucket = _last_fetch_reason.setdefault(kind, {})
-    if reason:
-        bucket[token] = str(reason)
-    else:
-        bucket.pop(token, None)
+    _default_session_state_engine.set_last_fetch_reason(kind, token, reason)
 
 def _get_last_fetch_reason(kind: str, token: str) -> Optional[str]:
-    if not kind or not token:
-        return None
-    return _last_fetch_reason.get(kind, {}).get(token)
+    return _default_session_state_engine.get_last_fetch_reason(kind, token)
 
 def getLastTuFetchReason(token: str) -> Optional[str]:
-    return _get_last_fetch_reason("tu", token)
+    return _default_session_state_engine.get_last_fetch_reason("tu", token)
 
 def _tu_reuse_max_age_sec() -> float:
-    try:
-        return max(0.0, float(getattr(Vars, "TU_INFO_REUSE_MAX_AGE_SEC", 90.0) or 90.0))
-    except (TypeError, ValueError):
-        return 90.0
+    return _default_session_state_engine.tu_reuse_max_age_sec()
 
 def _get_cached_tu_info(token: str, max_age_sec: Optional[float] = None) -> Optional[Dict[str, Any]]:
-    if not token:
-        return None
-    cached = _last_tu_info_cache.get(token)
-    if not cached:
-        return None
-    timestamp = _last_tu_info_at.get(token)
-    if max_age_sec is not None and timestamp is not None:
-        try:
-            if (time.time() - float(timestamp)) > float(max_age_sec):
-                return None
-        except (TypeError, ValueError):
-            pass
-    return dict(cached)
+    return _default_session_state_engine.get_cached_tu_info(token, max_age_sec)
 
 def _apply_cached_tu_updates(
     token: str,
     tu_info: Optional[Dict[str, Any]],
     **updates: Any,
 ) -> Optional[Dict[str, Any]]:
-    base = dict(tu_info) if tu_info else _get_cached_tu_info(token)
-    if not base:
-        return tu_info
-    base.update(updates)
-    _cache_tu_info(token, base)
-    if token in initial_tu_cache:
-        initial_tu_cache[token] = dict(base)
-    return base
+    return _default_session_state_engine.apply_cached_tu_updates(token, tu_info, **updates)
 
 def _synthesize_tu_after_dk(token: str, tu_info: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
     from mudae.core import session_engine as Session
-    max_power = Session.getMaxPowerForToken(token)
-    return _apply_cached_tu_updates(
-        token,
-        tu_info,
-        current_power=max_power,
-        max_power=max_power,
-        dk_ready=False,
-    )
+    max_power = getattr(Session, "getMaxPowerForToken", getMaxPowerForToken)(token)
+    return _default_session_state_engine.synthesize_tu_after_dk(token, tu_info, max_power)
 
 def _synthesize_tu_after_rt(token: str, tu_info: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
-    return _apply_cached_tu_updates(
-        token,
-        tu_info,
-        can_claim_now=True,
-        rt_available=False,
-    )
+    return _default_session_state_engine.synthesize_tu_after_rt(token, tu_info)
 
 def _merge_tu_info(primary: Optional[Dict[str, Any]], fallback: Optional[Dict[str, Any]]) -> Dict[str, Any]:
     merged: Dict[str, Any] = {}
