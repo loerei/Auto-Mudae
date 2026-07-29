@@ -2,8 +2,8 @@ from __future__ import annotations
 
 from pathlib import Path
 
-PROJECT_ROOT = Path(__file__).resolve().parents[2]
-SRC_DIR = PROJECT_ROOT / "src"
+PROJECT_ROOT = Path(__file__).resolve().parents[3]
+SRC_DIR = PROJECT_ROOT / "backend" / "src"
 CONFIG_DIR = PROJECT_ROOT / "config"
 LOGS_DIR = PROJECT_ROOT / "logs"
 CACHE_DIR = PROJECT_ROOT / "cache"

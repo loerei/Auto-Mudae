@@ -74,7 +74,7 @@ class ImportPayload(BaseModel):
 ensure_web_dirs()
 db = WebDB(WEB_DB_PATH)
 supervisor = WebSupervisor(db)
-PROJECT_ROOT = Path(__file__).resolve().parents[3]
+PROJECT_ROOT = Path(__file__).resolve().parents[4]
 DIST_DIR = PROJECT_ROOT / "frontend" / "dist"
 if not DIST_DIR.exists():
     DIST_DIR = PROJECT_ROOT / "webui" / "dist"
