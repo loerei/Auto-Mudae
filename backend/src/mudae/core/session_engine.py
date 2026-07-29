@@ -71,8 +71,24 @@ AUTO_GIVE_STATE_FILE = os.fspath(CONFIG_DIR / 'auto_give_state.json')
 
 # Store current user info during session
 from mudae.core.session_state import SessionStateEngine, SessionAction
+from mudae.core.session_dashboard import DashboardRenderer
+from mudae.core.claim_tracker import ClaimTracker
+from mudae.core.session_messaging import SessionMessageContext
 
 _state_engine = SessionStateEngine()
+_dashboard_renderer = DashboardRenderer()
+_claim_tracker = ClaimTracker()
+_message_context = SessionMessageContext()
+
+def loadClaimStats() -> Dict[str, Any]:
+    return _claim_tracker.load_stats()
+
+def updateClaimStats(character_name: str, kakera: int, user_id: Optional[str] = None) -> None:
+    _claim_tracker.record_claim(character_name, kakera, user_id)
+
+def detectManualClaim(message: Dict[str, Any], target_username: Optional[str] = None) -> Optional[Dict[str, Any]]:
+    return _claim_tracker.detect_manual_claim(message, target_username)
+
 
 @property
 def current_user_id() -> Optional[str]:
