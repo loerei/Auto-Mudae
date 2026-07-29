@@ -75,7 +75,9 @@ ensure_web_dirs()
 db = WebDB(WEB_DB_PATH)
 supervisor = WebSupervisor(db)
 PROJECT_ROOT = Path(__file__).resolve().parents[3]
-DIST_DIR = PROJECT_ROOT / "webui" / "dist"
+DIST_DIR = PROJECT_ROOT / "frontend" / "dist"
+if not DIST_DIR.exists():
+    DIST_DIR = PROJECT_ROOT / "webui" / "dist"
 SPA_HTML_HEADERS = {
     "Cache-Control": "no-store, no-cache, must-revalidate",
     "Pragma": "no-cache",
