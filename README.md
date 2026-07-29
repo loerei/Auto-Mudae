@@ -22,7 +22,7 @@ This repository contains a Windows-first Mudae automation workspace with the mai
 - `setup.bat` now routes to the same WebUI flow after environment setup.
 - The WebUI serves on `http://127.0.0.1:8765/` by default and provides `Overview`, `Accounts`, `Wishlist`, `Logs`, and `Settings`.
 - Standalone `OH`, `OC`, and `OQ` auto modes are controlled from the WebUI per account.
-- Legacy CLI entrypoints under `src/mudae/cli/` and the interactive `OC/OQ` helpers under `src/mudae/ouro/` are no longer part of the supported product surface.
+- Legacy CLI entrypoints under `backend/src/mudae/cli/` and the interactive `OC/OQ` helpers under `backend/src/mudae/ouro/` are no longer part of the supported product surface.
 
 ## Local-Only Runtime Files
 

@@ -29,9 +29,9 @@ if exist "%PORTABLE_PY%" (
     set "PYTHON=%ROOT%.venv\Scripts\python.exe"
 )
 if defined PYTHONPATH (
-    set "PYTHONPATH=%ROOT%src;%PYTHONPATH%"
+    set "PYTHONPATH=%ROOT%backend\src;%PYTHONPATH%"
 ) else (
-    set "PYTHONPATH=%ROOT%src"
+    set "PYTHONPATH=%ROOT%backend\src"
 )
 
 cd /d "%ROOT%"

@@ -126,9 +126,9 @@ if "%USE_PORTABLE%"=="1" (
 )
 
 if defined PYTHONPATH (
-    set "PYTHONPATH=%ROOT%src;%PYTHONPATH%"
+    set "PYTHONPATH=%ROOT%backend\src;%PYTHONPATH%"
 ) else (
-    set "PYTHONPATH=%ROOT%src"
+    set "PYTHONPATH=%ROOT%backend\src"
 )
 
 echo.

@@ -20,12 +20,12 @@ if exist "%PORTABLE_PY%" (
     set "PYTHON=%ROOT%.venv\Scripts\python.exe"
 )
 if defined PYTHONPATH (
-    set "PYTHONPATH=%ROOT%src;%PYTHONPATH%"
+    set "PYTHONPATH=%ROOT%backend\src;%PYTHONPATH%"
 ) else (
-    set "PYTHONPATH=%ROOT%src"
+    set "PYTHONPATH=%ROOT%backend\src"
 )
 
-set "UI_DIR=%ROOT%webui"
+set "UI_DIR=%ROOT%frontend"
 set "WEBUI_URL=http://127.0.0.1:8765/"
 set "MUDAE_WEBUI_CLOSE_PARENT_CONSOLE=1"
 
