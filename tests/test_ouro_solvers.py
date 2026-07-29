@@ -1,7 +1,7 @@
 from mudae.ouro.base_solver import OuroGameState
 from mudae.ouro.oh_solver import OhSolver
 from mudae.ouro.oc_solver import OcSolver
-from mudae.ouro.oq_solver import OqSolver
+from mudae.ouro.Oq_solver import OqSolver
 from mudae.ouro.task_runner import run_ouro_task
 
 def test_oh_solver():

@@ -34,6 +34,7 @@ from mudae.core.claim_tracker import ClaimTracker
 from mudae.core.session_messaging import SessionMessageContext
 from mudae.core.session_scheduler import SessionScheduler
 from mudae.core.roll_orchestrator import RollOrchestrator
+from mudae.core.roll_engine import RollEngine, RollDependencies
 from mudae.core.transfer_scheduler import TransferScheduler
 from mudae.core.command_gate import CommandAntiSpamGate
 
