@@ -1,7 +1,7 @@
 @echo off
 setlocal enabledelayedexpansion
 
-set "ROOT=%~dp0"
+set "ROOT=%~dp0..\"
 set "VENV_DIR=%ROOT%.venv"
 set "VENV_PY=%VENV_DIR%\\Scripts\\python.exe"
 set "PORTABLE_DIR=%ROOT%.portable"

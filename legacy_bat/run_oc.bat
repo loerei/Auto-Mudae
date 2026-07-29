@@ -4,7 +4,7 @@ chcp 65001 >nul
 set "PYTHONUTF8=1"
 set "PYTHONIOENCODING=utf-8"
 
-set "ROOT=%~dp0"
+set "ROOT=%~dp0..\"
 set "PORTABLE_DIR=%ROOT%.portable"
 set "PORTABLE_PY=%PORTABLE_DIR%\python\python.exe"
 set "PYTHON=python"
@@ -26,4 +26,5 @@ if defined PYTHONPATH (
 )
 
 cd /d "%ROOT%"
-"%PYTHON%" -m mudae.cli.oc_interactive %*
+"%PYTHON%" -m mudae.cli.oc
+pause
