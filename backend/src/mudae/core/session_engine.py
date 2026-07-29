@@ -70,27 +70,38 @@ CLAIM_STATS_FILE = os.fspath(CONFIG_DIR / 'claim_stats.json')
 AUTO_GIVE_STATE_FILE = os.fspath(CONFIG_DIR / 'auto_give_state.json')
 
 # Store current user info during session
-current_user_id: Optional[str] = None
-current_user_ids: Dict[str, str] = {}
-current_user_names: Dict[str, str] = {}
-current_user_name: Optional[str] = None
-processed_external_roll_ids: Set[str] = set()
-_processed_external_roll_queue: Deque[str] = deque()
-EXTERNAL_ROLL_ID_CACHE = 5000
-external_after_ids: Dict[str, str] = {}
-external_scan_activity: Dict[str, int] = {}
-initial_tu_cache: Dict[str, Dict[str, Any]] = {}
-_stop_requested: bool = False
-_last_interaction_context: Dict[str, Dict[str, Any]] = {}
-_last_seen_cache: Dict[str, str] = {}
-_last_seen_loaded: bool = False
-_last_seen_dirty: bool = False
-_last_seen_last_flush: float = 0.0
-_last_seen_file_signature: Optional[Tuple[int, int]] = None
-_last_seen_lock = threading.Lock()
-_last_tu_info_cache: Dict[str, Dict[str, Any]] = {}
-_last_tu_info_at: Dict[str, float] = {}
-_last_wishlist_cache: Dict[str, Dict[str, Any]] = {}
+from mudae.core.session_state import SessionStateEngine, SessionAction
+
+_state_engine = SessionStateEngine()
+
+@property
+def current_user_id() -> Optional[str]:
+    return _state_engine.get_snapshot()["current_user_id"]
+
+@property
+def current_user_ids() -> Dict[str, str]:
+    return _state_engine.get_snapshot()["current_user_ids"]
+
+@property
+def current_user_names() -> Dict[str, str]:
+    return _state_engine.get_snapshot()["current_user_names"]
+
+@property
+def _last_tu_info_cache() -> Dict[str, Dict[str, Any]]:
+    return _state_engine.get_snapshot()["last_tu_info_cache"]
+
+@property
+def _last_wishlist_cache() -> Dict[str, Dict[str, Any]]:
+    return _state_engine.get_snapshot()["last_wishlist_cache"]
+
+def _dispatch_session_actions(actions: List[SessionAction]) -> None:
+    for action in actions:
+        try:
+            if action.action_type == "LOG_EMIT":
+                emit_log(action.payload.get("level", "INFO"), action.payload.get("message", ""))
+        except Exception as e:
+            print(f"Error dispatching SessionAction {action.action_type}: {e}")
+
 _last_wishlist_at: Dict[str, float] = {}
 _last_fetch_reason: Dict[str, Dict[str, str]] = {
     "tu": {},
