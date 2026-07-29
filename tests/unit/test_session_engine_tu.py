@@ -113,8 +113,11 @@ def _stub_get_tu_info_dependencies(monkeypatch: Any, *, wait_result: Tuple[Any, 
     monkeypatch.setattr(Session, "getMaxPowerForToken", lambda _token: 110)
     monkeypatch.setattr(Session.Latency, "get_active_tier", lambda: "aggressive_auto")
     monkeypatch.setattr(Session.Fetch, "fetch_messages", lambda *_args, **_kwargs: (_DummyResponse(), []))
+    monkeypatch.setattr(Session, "_acquire_same_account_action_gate", lambda *_args, **_kwargs: (None, True))
     monkeypatch.setattr(Session.Fetch, "wait_for_interaction_message", lambda *_args, **_kwargs: wait_result)
     monkeypatch.setattr(Session, "current_user_name", None)
+    Session._last_tu_info_cache.clear()
+    Session._last_tu_info_at.clear()
 
 
 def test_get_tu_info_uses_user_command_match_when_interaction_id_misses(monkeypatch: Any) -> None:

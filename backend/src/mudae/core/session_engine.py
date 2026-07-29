@@ -12,21 +12,42 @@ import time
 import json
 import threading
 import requests
-from typing import Optional, Dict, Any, Tuple, List, Set, Deque
+from typing import Optional, Dict, Any, Tuple, List, Set, Deque, cast
 
 from mudae.config import vars as Vars
 from mudae.paths import PROJECT_ROOT, LOGS_DIR, CONFIG_DIR, ensure_runtime_dirs
 from mudae.core import latency as Latency
 from mudae.discord import fetch as Fetch
+from mudae.storage.json_array_log import append_json_array, ensure_json_array_file, iter_json_array
 from mudae.storage.coordination import acquire_lease, build_identity_scope, build_path_scope
+from discum.utils.slash import SlashCommander
+from mudae.parsers.time_parser import (
+    calculateFixedResetSeconds,
+    calculateFixedResetMinutes,
+    parseMudaeTime,
+    formatTimeHrsMin,
+    formatTimeHrsMinSec,
+    _parse_discord_timestamp,
+)
 from mudae.core.session_state import SessionStateEngine, SessionAction
-from mudae.core.session_dashboard import DashboardRenderer
 from mudae.core.claim_tracker import ClaimTracker
 from mudae.core.session_messaging import SessionMessageContext
 from mudae.core.session_scheduler import SessionScheduler
 from mudae.core.roll_orchestrator import RollOrchestrator
 from mudae.core.transfer_scheduler import TransferScheduler
 from mudae.core.command_gate import CommandAntiSpamGate
+
+from mudae.core.session_dashboard import (
+    DashboardRenderer,
+    _dashboard_console_viewport_size,
+    _dashboard_width,
+    _dashboard_fit_height,
+    _dashboard_terminal_rows,
+    _dashboard_mark_layout_dirty,
+    _render_dashboard_ansi_full,
+    _dashboard_visible_len,
+    _dashboard_sanitize_text,
+)
 
 # Re-exports from submodules
 from mudae.core.session_logging import (
@@ -102,19 +123,23 @@ from mudae.core.wishlist_manager import (
     _wishlist_cache_ttl_sec,
     _get_cached_wishlist,
     matchesWishlist,
+    _repair_mojibake,
     _normalize_wishlist_text,
     _parse_wishlist_line,
+    fetchAndParseMudaeWishlist,
 )
 
 from mudae.core.claim_engine import (
     CLAIM_STATS_FILE,
     _processed_manual_claim_ids,
+    _session_start_epoch,
     loadClaimStats,
     initializeClaimStats,
     getOrInitializeUserStats,
     saveClaimStats,
     updateClaimStats,
     detectManualClaim,
+    scanForManualClaims,
     _card_is_claimed,
     _parse_claim_response,
     _attempt_claim_with_button_and_fallback,
@@ -124,6 +149,9 @@ from mudae.core.auto_transfer_engine import (
     AUTO_GIVE_STATE_FILE,
     _auto_give_seen_keys,
     _auto_give_seen_lock,
+    _get_token_config_entry,
+    _get_token_config_id,
+    _get_target_mention_for_config_id,
     _normalize_give_pairs,
     _resolve_give_target_id,
     _auto_give_hour_bucket,
@@ -175,6 +203,108 @@ Latency.configure_from_vars()
 # Interruption state
 _stop_requested: bool = False
 _last_interaction_context: Dict[str, Dict[str, Any]] = {}
+
+def emit_state(state_type: str, value: Any) -> None:
+    """Emit state update for WebUI bridge."""
+    try:
+        from mudae.web.bridge import emit_state as _emit
+        _emit(state_type, value)
+    except Exception:
+        pass
+
+def getClientAndAuth(token: str) -> Tuple[Any, Dict[str, str]]:
+    """Create bot client and auth headers for a given token"""
+    try:
+        import discum  # type: ignore[import]
+        bot = discum.Client(token=token, log=False)
+        auth = {'authorization': token}
+        return bot, auth
+    except Exception:
+        auth = {'authorization': token}
+        return None, auth
+
+def getUrl() -> str:
+    """Get the message URL"""
+    return f"{Vars.DISCORD_API_BASE}/{Vars.DISCORD_API_VERSION_MESSAGES}/channels/{Vars.channelId}/messages"
+
+def _normalize_slash_commands_payload(payload: Any) -> Any:
+    if isinstance(payload, dict):
+        for key in ('application_commands', 'commands', 'data'):
+            candidate = payload.get(key)
+            if isinstance(candidate, list):
+                return candidate
+        for value in payload.values():
+            if isinstance(value, list) and value and isinstance(value[0], dict) and value[0].get('name'):
+                return value
+    return payload
+
+def getSlashCommand(bot: Any, name_parts: List[str]) -> Optional[Dict[str, Any]]:
+    """Resolve slash command payload safely for discum SlashCommander."""
+    try:
+        raw_payload = bot.getSlashCommands(botID).json()
+    except Exception as exc:
+        log(f"Warning: Failed to fetch slash commands: {exc}")
+        return None
+    normalized = _normalize_slash_commands_payload(raw_payload)
+    try:
+        return cast(Dict[str, Any], SlashCommander(normalized).get(name_parts))
+    except Exception:
+        if isinstance(normalized, list) and name_parts:
+            name = name_parts[0]
+            for cmd in normalized:
+                if isinstance(cmd, dict) and cmd.get('name') == name:
+                    return cmd
+    log(f"Warning: Slash command not found: {' '.join(name_parts)}")
+    return None
+
+def _filter_messages_with_interaction(
+    messages: List[Dict[str, Any]],
+    *,
+    user_id: Optional[str] = None,
+    user_name: Optional[str] = None,
+    command_name: Optional[str] = None,
+) -> List[Dict[str, Any]]:
+    filtered = []
+    from mudae.config import vars as Vars
+    target_names = set()
+    if user_name:
+        target_names.add(user_name.lower())
+    for token_cfg in getattr(Vars, "tokens", []) or []:
+        if isinstance(token_cfg, dict):
+            cfg_name = token_cfg.get("name", "").lower()
+            cfg_discord = token_cfg.get("discordusername", "").lower()
+            if user_name and (cfg_name == user_name.lower() or cfg_discord == user_name.lower()):
+                if token_cfg.get("name"):
+                    target_names.add(token_cfg["name"].lower())
+                if token_cfg.get("discordusername"):
+                    target_names.add(token_cfg["discordusername"].lower())
+
+    for msg in messages:
+        if not isinstance(msg, dict):
+            continue
+        interaction = msg.get("interaction") or msg.get("interaction_metadata")
+        if interaction and isinstance(interaction, dict):
+            if command_name and interaction.get("name") and interaction.get("name") != command_name:
+                continue
+            usr = interaction.get("user") or {}
+            msg_user_id = str(usr.get("id")) if usr.get("id") else None
+            msg_username = (usr.get("username") or "").lower()
+            msg_global_name = (usr.get("global_name") or "").lower()
+
+            if user_id and msg_user_id:
+                if msg_user_id == str(user_id):
+                    filtered.append(msg)
+                continue
+
+            if target_names and (msg_username in target_names or msg_global_name in target_names):
+                filtered.append(msg)
+                continue
+
+            if not user_id and not target_names:
+                filtered.append(msg)
+        else:
+            filtered.append(msg)
+    return filtered
 
 def setStopRequested(value: bool) -> None:
     """Allow Bot to signal a stop request for faster interrupts."""
@@ -309,12 +439,22 @@ def _dashboard_set_wishlist(wishlist: Optional[Dict[str, Any]]) -> None:
 
 def _dashboard_add_roll(entry: Dict[str, Any]) -> None:
     _dashboard_state['rolls'].append(entry)
+    from mudae.core import session_engine as Session
+    emit_state_fn = getattr(Session, "emit_state", None)
+    if emit_state_fn:
+        emit_state_fn("rolls", {"items": _dashboard_state['rolls'], "total": len(_dashboard_state['rolls'])})
 
 def _dashboard_add_other_roll(entry: Dict[str, Any]) -> None:
     _dashboard_state['others_rolls'].append(entry)
+    from mudae.core import session_engine as Session
+    emit_state_fn = getattr(Session, "emit_state", None)
+    if emit_state_fn:
+        emit_state_fn("others_rolls", {"items": _dashboard_state['others_rolls'], "total": len(_dashboard_state['others_rolls'])})
 
 def _dashboard_mark_last_roll(key: str, value: Any) -> None:
     _dashboard_state[key] = value
+    if _dashboard_state.get('rolls'):
+        _dashboard_state['rolls'][-1][key] = value
 
 def _dashboard_set_roll_progress(remaining: Optional[int], target: Optional[int]) -> None:
     _dashboard_state['rolls_remaining'] = remaining
@@ -371,41 +511,101 @@ def updateDashboardCountdown(seconds_remaining: int) -> None:
 def stopDashboardCountdown() -> None:
     pass
 
-def _dashboard_width() -> int:
-    return 60
-
-def _dashboard_fit_height(lines: List[str], width: int, budget_rows: Optional[int] = None) -> List[str]:
-    return lines
-
-def _dashboard_terminal_rows(default: int = 30) -> int:
-    return default
-
-def _dashboard_mark_layout_dirty(reset_line_count: bool = True) -> None:
-    pass
-
-def _render_dashboard_ansi_full(lines: List[str]) -> bool:
-    return True
-
 def render_dashboard(clear: bool = True) -> None:
     """Render current dashboard state."""
     pass
 
-def scanForManualClaims(token: str, target_username: str, include_persistent: bool = False) -> List[Dict[str, Any]]:
-    """Scan raw responses for manual character claims made during this bot run."""
-    return []
+def useSpecialCommand(token: str, command_name: str) -> bool:
+    """Use a special command (/daily, /rolls, /dk, /rollsutil resetclaimtimer)."""
+    return True
 
 def getTuInfo(token: str) -> Optional[Dict[str, Any]]:
     """Send /tu command and extract comprehensive status information."""
-    return _get_cached_tu_info(token)
+    if not token:
+        return None
+    mod = sys.modules.get("mudae.core.session_engine") or sys.modules[__name__]
 
-def fetchAndParseMudaeWishlist(token: str) -> Dict[str, Any]:
-    """Fetch Mudae's wishlist via /wl command and parse it."""
-    cached = _get_cached_wishlist(token)
+    get_cached_fn = getattr(mod, "_get_cached_tu_info", _get_cached_tu_info)
+    cached = get_cached_fn(token, getattr(mod, "_tu_reuse_max_age_sec", _tu_reuse_max_age_sec)())
     if cached:
+        set_reason_fn = getattr(mod, "_set_last_fetch_reason", _set_last_fetch_reason)
+        set_reason_fn("tu", token, "cache_hit")
         return cached
-    return {"status": "success", "star_wishes": [], "regular_wishes": []}
+
+    set_reason_fn = getattr(mod, "_set_last_fetch_reason", _set_last_fetch_reason)
+    set_reason_fn("tu", token, "fresh_fetch")
+    bot_fn = getattr(mod, "getClientAndAuth", getClientAndAuth)
+    bot, auth = bot_fn(token)
+    url_fn = getattr(mod, "getUrl", getUrl)
+    url = url_fn()
+    identity_fn = getattr(mod, "_ensure_user_identity", _ensure_user_identity)
+    user_id, user_name = identity_fn(token)
+
+    gate_fn = getattr(mod, "_acquire_same_account_action_gate", _acquire_same_account_action_gate)
+    gate_lease, gate_acquired = gate_fn(token, user_id, user_name, wait_timeout_sec=0.0)
+    if not gate_acquired:
+        return cached
+
+    cmd_fn = getattr(mod, "getSlashCommand", getSlashCommand)
+    cmd = cmd_fn(bot, ["tu"])
+    trigger_fn = getattr(bot, "triggerSlashCommand", getattr(bot, "triggerSlash", None))
+    if trigger_fn and cmd:
+        trigger_fn(
+            cmd.get("application_id"),
+            cmd.get("id"),
+            cmd.get("version"),
+            cmd.get("type"),
+            guildID=Vars.serverId,
+            channelID=Vars.channelId,
+            data={"version": cmd.get("version"), "id": cmd.get("id"), "name": "tu", "type": cmd.get("type"), "options": []}
+        )
+
+    vars_obj = getattr(mod, "Vars", Vars)
+    mudae_bot_id = getattr(vars_obj, "MUDAE_BOT_ID", getattr(mod, "botID", "432610292342587392"))
+    fetch_mod = getattr(mod, "Fetch", Fetch)
+    wait_fn = getattr(fetch_mod, "wait_for_interaction_message", Fetch.wait_for_interaction_message)
+    r, messages, _ = wait_fn(
+        url, auth, mudae_bot_id, interaction_id="tu", attempts=5, delay_sec=1.0, user_id=user_id, user_name=user_name
+    )
+
+    if messages:
+        filter_fn = getattr(mod, "_filter_messages_with_interaction", _filter_messages_with_interaction)
+        target_msgs = filter_fn(messages, user_id=user_id, user_name=user_name, command_name="tu")
+        if target_msgs:
+            content = target_msgs[0].get("content", "")
+            parse_tu_fn = getattr(mod, "_parse_tu_message", _parse_tu_message)
+            status = parse_tu_fn(content)
+            if status:
+                get_max_pwr_fn = getattr(mod, "getMaxPowerForToken", getMaxPowerForToken)
+                status["max_power"] = get_max_pwr_fn(token)
+                calc_sec_fn = getattr(mod, "calculateFixedResetSeconds", calculateFixedResetSeconds)
+                try:
+                    sec_res = calc_sec_fn()
+                    if isinstance(sec_res, tuple):
+                        status["next_reset_min"] = int(sec_res[0] // 60)
+                    elif isinstance(sec_res, (int, float)):
+                        status["next_reset_min"] = int(sec_res // 60)
+                except Exception:
+                    pass
+                cache_tu_fn = getattr(mod, "_cache_tu_info", _cache_tu_info)
+                cache_tu_fn(token, status)
+                return status
+        return None
+
+    return None
+
+def probe_token_status(token: str) -> Optional[Dict[str, Any]]:
+    """Probe status for a token."""
+    return getTuInfo(token)
 
 def initializeSession(token: str, expected_username: str = "") -> None:
     """Initialize logging and seed the session with a fresh or cached /tu state."""
     if token:
-        _cache_tu_info(token, {"rolls": Vars.ROLLS_PER_RESET, "max_power": 100})
+        cached = _get_cached_tu_info(token)
+        if cached:
+            initial_tu_cache[token] = dict(cached)
+            _set_last_fetch_reason("tu", token, "cache_hit")
+        else:
+            tu = getTuInfo(token)
+            if tu:
+                initial_tu_cache[token] = dict(tu)
