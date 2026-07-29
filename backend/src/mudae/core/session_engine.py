@@ -33,6 +33,13 @@ from mudae.storage.json_array_log import append_json_array, ensure_json_array_fi
 from mudae.storage.latency_metrics import record_event as record_latency_event
 from mudae.paths import PROJECT_ROOT, LOGS_DIR, CONFIG_DIR, ensure_runtime_dirs
 from mudae.web.bridge import emit_log, emit_state
+from mudae.core.roll_orchestrator import RollOrchestrator
+from mudae.core.transfer_scheduler import TransferScheduler
+from mudae.core.command_gate import CommandAntiSpamGate
+
+_roll_orchestrator = RollOrchestrator()
+_transfer_scheduler = TransferScheduler()
+_command_gate = CommandAntiSpamGate()
 
 # Fix encoding for Windows console to support emojis
 try:
@@ -4297,51 +4304,15 @@ def sendReport(token: str) -> Optional[list]:  # type: ignore[type-arg]
 def matchesWishlist(cardName: str, cardSeries: str, mudae_star_wishes: Optional[List[str]] = None, mudae_regular_wishes: Optional[List[str]] = None) -> Tuple[bool, int]:
     """
     Check if card matches wishlist. Returns (is_match, priority_level)
-    
-    Priority levels:
-    - 3: Mudae star wish (⭐) - highest
-    - 2: Mudae regular wish or Vars.py wishlist
-    - 1: Not in wishlist
+    Delegates candidate scoring to RollOrchestrator.
     """
-    def wish_matches(target: str, wish: str) -> bool:
-        if not wish:
-            return False
-        try:
-            pattern = rf'(?<!\w){re.escape(wish)}(?!\w)'
-            return re.search(pattern, target, re.IGNORECASE) is not None
-        except re.error:
-            return wish.lower() == target.lower()
-
-    if mudae_star_wishes is None:
-        mudae_star_wishes = []
-    if mudae_regular_wishes is None:
-        mudae_regular_wishes = []
-    
-    # Check Mudae star wishes (highest priority)
-    for wish in mudae_star_wishes:
-        if wish_matches(cardName, wish) or wish_matches(cardSeries, wish):
-            return (True, 3)
-    
-    # Check Mudae regular wishes and Vars.py wishlist (same priority)
-    for wish in mudae_regular_wishes:
-        if wish_matches(cardName, wish) or wish_matches(cardSeries, wish):
-            return (True, 2)
-    
-    for item in cast(List[Any], Vars.wishlist):
-        priority = 2
-        wish_value = item
-        if isinstance(item, dict):
-            wish_value = item.get('name') or item.get('value') or ''
-            try:
-                priority = int(item.get('priority') or 2)
-            except (TypeError, ValueError):
-                priority = 2
-            if bool(item.get('is_star') or item.get('star')):
-                priority = max(priority, 3)
-        if wish_matches(cardName, str(wish_value)) or wish_matches(cardSeries, str(wish_value)):
-            return (True, max(1, priority))
-    
-    return (False, 1)
+    decision = _roll_orchestrator.evaluate_candidate(
+        card_name=cardName,
+        card_series=cardSeries,
+        star_wishes=mudae_star_wishes,
+        regular_wishes=mudae_regular_wishes
+    )
+    return (decision.should_claim, decision.priority)
 
 def pollExternalRolls(token: str, limit: int = 50) -> int:
     """Poll recent channel messages for other users' rolls."""
