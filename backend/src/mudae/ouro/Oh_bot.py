@@ -24,6 +24,21 @@ from mudae.ouro.oh_config import load_oh_config, update_stats, default_stats_pat
 from mudae.ouro.oh_parse import parse_oh_message, summarize_grid, OhGrid, diagnose_oh_message
 from mudae.ouro.oh_solver import OhSolver
 from mudae.ouro.sphere_reward_parse import parse_reward_message
+from mudae.ouro.common_bot import (
+    message_lag_ms,
+    emit_bot_latency,
+    poll_delay,
+    post_action_pause,
+    acquire_action_lease,
+    select_user,
+    parse_clicks_and_time,
+    safe_response_json,
+    truncate_text,
+    serialize_full_response,
+    extract_error_fields,
+    log_refresh_error,
+    fetch_reward_messages,
+)
 from mudae.web.bridge import emit_log, emit_runner_event
 
 try:
@@ -79,20 +94,11 @@ def _timestamp() -> str:
 
 
 def _message_lag_ms(message: Optional[Dict[str, Any]]) -> Optional[int]:
-    if not message:
-        return None
-    timestamp = message.get("timestamp")
-    parsed = _parse_discord_timestamp(timestamp) if timestamp else None
-    if parsed is None:
-        return None
-    return int(max(0.0, (time.time() - parsed) * 1000.0))
+    return message_lag_ms(message)
 
 
 def _emit_latency(event: str, **fields: Any) -> None:
-    payload = dict(fields)
-    payload.setdefault("flow", "oh")
-    payload.setdefault("tier", Latency.get_active_tier())
-    record_latency_event(event, **payload)
+    emit_bot_latency("oh", event, **fields)
 
 
 def _poll_delay(
@@ -103,18 +109,17 @@ def _poll_delay(
     legacy_scale: float,
     legacy_cap: float,
 ) -> float:
-    if schedule:
-        if attempt_index < len(schedule):
-            return max(0.0, float(schedule[attempt_index]))
-        return max(0.0, float(schedule[-1]))
-    return min(legacy_cap, delay_sec * (legacy_scale ** max(0, attempt_index)))
+    return poll_delay(
+        attempt_index,
+        delay_sec,
+        schedule,
+        legacy_scale=legacy_scale,
+        legacy_cap=legacy_cap,
+    )
 
 
 def _post_action_pause(default_sec: float) -> None:
-    if Latency.get_active_tier() == "legacy":
-        time.sleep(default_sec)
-        return
-    time.sleep(min(0.08, max(0.0, default_sec)))
+    post_action_pause(default_sec)
 
 
 def _message_url() -> str:
@@ -134,60 +139,15 @@ def _log_event(entry: Dict[str, Any]) -> None:
 
 
 def _acquire_action_lease(token: str, user_name: str):
-    scope, owner_label = build_identity_scope(
-        "mudae-action",
-        server_id=Vars.serverId,
-        channel_id=Vars.channelId,
-        token=token,
-        user_name=user_name,
-    )
-    return acquire_lease(
-        scope,
-        owner_label,
-        ttl_sec=ACTION_LEASE_TTL_SEC,
-        heartbeat_sec=ACTION_LEASE_HEARTBEAT_SEC,
-        wait_timeout_sec=0.0,
-    )
+    return acquire_action_lease(token, user_name)
 
 
 def _select_user() -> Dict[str, str]:
-    print("\n" + "=" * 50)
-    print("Available Users:")
-    print("=" * 50)
-    if not Vars.tokens:
-        raise RuntimeError("No tokens configured in Vars.tokens")
-    for i, user in enumerate(Vars.tokens, 1):
-        print(f"{i}. {user['name']}")
-    while True:
-        try:
-            choice = input("\nSelect user (enter number): ").strip()
-            idx = int(choice) - 1
-            if 0 <= idx < len(Vars.tokens):
-                selected = Vars.tokens[idx]
-                print(f"Selected: {selected['name']}")
-                return selected
-            print("Invalid selection. Try again.")
-        except ValueError:
-            print("Please enter a valid number.")
+    return select_user()
 
 
 def _parse_clicks_and_time(content: str, default_clicks: int, default_time_sec: int) -> Tuple[int, int]:
-    clicks = default_clicks
-    time_sec = default_time_sec
-    if content:
-        match_clicks = re.search(r"click\s*\*\*(\d+)\*\*", content, re.IGNORECASE)
-        if match_clicks:
-            try:
-                clicks = int(match_clicks.group(1))
-            except ValueError:
-                pass
-        match_minutes = re.search(r"for\s+(\d+)\s+minute", content, re.IGNORECASE)
-        if match_minutes:
-            try:
-                time_sec = int(match_minutes.group(1)) * 60
-            except ValueError:
-                pass
-    return clicks, time_sec
+    return parse_clicks_and_time(content, default_clicks, default_time_sec)
 
 
 def _message_hash(message: Dict[str, Any]) -> str:
@@ -519,41 +479,19 @@ def _dynamic_samples(base: int, unknown_count: int) -> int:
 
 
 def _safe_response_json(response: Optional[requests.Response]) -> Optional[Any]:
-    if response is None:
-        return None
-    try:
-        return response.json()
-    except Exception:
-        return None
+    return safe_response_json(response)
 
 
 def _truncate_text(text: Optional[str], max_len: int) -> Optional[str]:
-    if text is None:
-        return None
-    if len(text) <= max_len:
-        return text
-    return text[:max_len] + f"...(truncated {len(text) - max_len} chars)"
+    return truncate_text(text, max_len)
 
 
 def _serialize_full_response(payload: Any, response: Optional[requests.Response]) -> Optional[str]:
-    text = None
-    if payload is not None:
-        try:
-            text = json.dumps(payload, ensure_ascii=False)
-        except Exception:
-            text = str(payload)
-    elif response is not None:
-        try:
-            text = response.text
-        except Exception:
-            text = None
-    return _truncate_text(text, 100_000)
+    return serialize_full_response(payload, response)
 
 
 def _extract_error_fields(payload: Any) -> Tuple[Optional[str], Optional[Any]]:
-    if isinstance(payload, dict):
-        return payload.get("message"), payload.get("code")
-    return (None, None)
+    return extract_error_fields(payload)
 
 
 def _log_refresh_error(
@@ -565,29 +503,17 @@ def _log_refresh_error(
     attempt: int,
     extra: Optional[Dict[str, Any]] = None,
 ) -> None:
-    error_message, error_code = _extract_error_fields(payload)
-    response_snippet = None
-    if response is not None:
-        try:
-            response_snippet = _truncate_text(response.text, 500)
-        except Exception:
-            response_snippet = None
-    entry: Dict[str, Any] = {
-        "type": "warn",
-        "message": label,
-        "message_id": message_id,
-        "refresh_source": refresh_source,
-        "attempt": attempt,
-        "status_code": response.status_code if response is not None else None,
-        "error_message": error_message,
-        "error_code": error_code,
-        "response_snippet": response_snippet,
-        "full_response": _serialize_full_response(payload, response),
-        "source": "Oh_bot",
-    }
-    if extra:
-        entry.update(extra)
-    _log_event(entry)
+    log_refresh_error(
+        LOG_FILE,
+        "Oh_bot",
+        label,
+        response,
+        payload,
+        message_id,
+        refresh_source,
+        attempt,
+        extra,
+    )
 
 
 def _fetch_oh_message_snapshot(

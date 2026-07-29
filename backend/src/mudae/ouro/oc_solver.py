@@ -5,13 +5,9 @@ class OcSolver(BaseOuroSolver):
     Pure solver for Ouro Chest (OC) combination puzzles.
     """
     def solve(self, game_state: OuroGameState) -> OuroSolverResult:
-        if game_state.mode.lower() not in ("oc", "chest"):
-            return OuroSolverResult(
-                success=False,
-                mode=game_state.mode,
-                error_mode="INVALID_MODE",
-                metadata={"reason": "Mode mismatch for OcSolver"}
-            )
+        err = self.validate_mode(game_state, ("oc", "chest"), "OcSolver")
+        if err:
+            return err
         moves = ["unlock_combination_1", "open_chest"]
         return OuroSolverResult(
             success=True,
