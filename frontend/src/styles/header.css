@@ -1,0 +1,198 @@
+/* =========================================================================
+   APP HEADER & UNIFIED CONTAINER STYLES
+   ========================================================================= */
+
+/* Unified Content Card Shell */
+.unified-content-card {
+  margin-top: 1rem;
+  padding: 1.5rem;
+  border-radius: var(--radius-md, 18px);
+  background: var(--surface-card, rgba(28, 25, 23, 0.85));
+  border: 1px solid var(--border-soft, rgba(255, 255, 255, 0.1));
+  box-shadow: 0 16px 40px rgba(0, 0, 0, 0.25);
+  backdrop-filter: blur(12px);
+  min-height: 520px;
+}
+
+.unified-content-card .page-header {
+  margin-bottom: 1.25rem;
+}
+
+.unified-content-card .panel {
+  background: var(--surface-secondary, rgba(255, 255, 255, 0.03));
+  border: 1px solid var(--border-soft, rgba(255, 255, 255, 0.08));
+}
+
+/* Toast Notification Pill (Bottom-Right) */
+.toast-notification-pill {
+  position: fixed;
+  bottom: 1.5rem;
+  right: 1.5rem;
+  z-index: 10000;
+  display: inline-flex;
+  align-items: center;
+  gap: 0.65rem;
+  padding: 0.6rem 1rem;
+  border-radius: 999px;
+  background: rgba(30, 27, 24, 0.92);
+  border: 1px solid rgba(255, 255, 255, 0.15);
+  box-shadow: 0 12px 32px rgba(0, 0, 0, 0.45);
+  backdrop-filter: blur(16px);
+  color: var(--text-primary, #fff);
+  font-size: 0.85rem;
+  font-weight: 500;
+  max-width: 24rem;
+}
+
+.toast-dot {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: #3b82f6;
+  box-shadow: 0 0 8px rgba(59, 130, 246, 0.8);
+  flex-shrink: 0;
+}
+
+.toast-message {
+  line-height: 1.3;
+}
+
+.toast-close-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 20px;
+  height: 20px;
+  padding: 0 !important;
+  border-radius: 50%;
+  background: transparent;
+  border: none;
+  color: var(--text-muted, rgba(255, 255, 255, 0.6));
+  cursor: pointer;
+  flex-shrink: 0;
+  transition: all 0.15s ease;
+}
+
+.toast-close-btn:hover {
+  background: rgba(255, 255, 255, 0.15);
+  color: #fff;
+}
+
+/* Header Dock & Single-Row Controls */
+.header-controls {
+  display: flex;
+  align-items: center;
+  flex-wrap: nowrap;
+  gap: 0.5rem;
+}
+
+.status-pill-group {
+  display: flex;
+  align-items: center;
+  gap: 0.4rem;
+}
+
+.pill-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.35rem;
+  padding: 0.3rem 0.65rem;
+  border-radius: 999px;
+  background: var(--surface-secondary, rgba(255, 255, 255, 0.04));
+  border: 1px solid var(--border-soft, rgba(255, 255, 255, 0.08));
+  font-size: 0.78rem;
+  font-weight: 500;
+}
+
+.dot-indicator {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+}
+.dot-indicator.green { background: #10b981; box-shadow: 0 0 8px rgba(16, 185, 129, 0.6); }
+.dot-indicator.amber { background: #f59e0b; box-shadow: 0 0 8px rgba(245, 158, 11, 0.6); }
+
+.icon-action-group {
+  display: flex;
+  align-items: center;
+  gap: 0.4rem;
+}
+
+.icon-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 34px;
+  height: 34px;
+  padding: 0;
+  border-radius: 50%;
+  background: var(--surface-secondary, rgba(255, 255, 255, 0.06));
+  border: 1px solid var(--border-soft, rgba(255, 255, 255, 0.1));
+  color: var(--text-primary);
+  cursor: pointer;
+  flex-shrink: 0;
+  line-height: 1;
+  transition: all 0.18s ease;
+}
+
+.icon-btn svg {
+  display: block;
+  flex-shrink: 0;
+}
+
+.icon-btn:hover {
+  background: rgba(255, 255, 255, 0.12);
+  transform: translateY(-1px);
+}
+
+.icon-btn.danger-icon:hover {
+  background: rgba(239, 68, 68, 0.2);
+  border-color: rgba(239, 68, 68, 0.5);
+  color: #ef4444;
+}
+
+/* Linear Studio Dock Header */
+.variant-b .linear-dock-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 1rem;
+}
+
+.dock-brand {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  font-weight: 700;
+  font-size: 1.1rem;
+}
+
+.dock-tabs {
+  display: flex;
+  align-items: center;
+  gap: 0.35rem;
+  background: var(--surface-secondary, rgba(255, 255, 255, 0.04));
+  padding: 0.25rem;
+  border-radius: 999px;
+  border: 1px solid var(--border-soft, rgba(255, 255, 255, 0.08));
+}
+
+.dock-tab-item {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.35rem;
+  padding: 0.35rem 0.75rem;
+  border-radius: 999px;
+  border: none;
+  background: transparent;
+  color: var(--text-muted);
+  font-size: 0.82rem;
+  font-weight: 500;
+  cursor: pointer;
+  transition: all 0.15s ease;
+}
+
+.dock-tab-item.active {
+  background: var(--button-bg, rgba(255, 255, 255, 0.15));
+  color: var(--text-primary);
+}

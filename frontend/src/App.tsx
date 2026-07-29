@@ -7,6 +7,7 @@ import { buildFadeUp, buildHighlightFlash, buildStaggerContainer, getTabTransiti
 import { LEGACY_SECTION_GROUPS, SETTINGS_COMPAT_FIELD_META } from "./settings-compat";
 import { normalizeUiSettings, useResolvedTheme } from "./theme";
 import { SettingsWorkspace, THEME_LABELS } from "./settings-ui";
+import { AppHeader, HeaderProps } from "./Header";
 import {
   Account,
   AccountHistory,
@@ -409,7 +410,7 @@ export default function App() {
   const [wishlist, setWishlist] = useState<WishlistPayload | null>(null);
   const [history, setHistory] = useState<AccountHistory | null>(null);
   const [selectedAccountId, setSelectedAccountId] = useState<number | null>(null);
-  const [notice, setNotice] = useState<string>("Loading...");
+  const [notice, setNotice] = useState<string>("");
   const [logMode, setLogMode] = useState<string>("");
   const [logLevel, setLogLevel] = useState<string>("");
   const [globalWishlistDraft, setGlobalWishlistDraft] = useState<WishlistItem[]>([]);
@@ -667,9 +668,7 @@ export default function App() {
   }
 
   useEffect(() => {
-    void refreshAll(false)
-      .then(() => setNotice("Connected to local daemon."))
-      .catch((error: Error) => setNotice(error.message));
+    void refreshAll(false).catch((error: Error) => setNotice(error.message));
   }, []);
 
   useEffect(() => {
@@ -698,6 +697,12 @@ export default function App() {
   useEffect(() => {
     activeTabRef.current = activeTab;
   }, [activeTab]);
+
+  useEffect(() => {
+    if (!notice) return;
+    const timer = setTimeout(() => setNotice(""), 3000);
+    return () => clearTimeout(timer);
+  }, [notice]);
 
   useEffect(() => {
     logFilterRef.current = { mode: logMode, level: logLevel };
@@ -752,58 +757,55 @@ export default function App() {
 
   const accountOptions = overview?.accounts ?? [];
 
+  const headerProps: HeaderProps = {
+    activeTab,
+    setActiveTab,
+    tabs: [...TABS],
+    totalAccounts,
+    runningCount: overview?.running_count ?? 0,
+    queuedCount,
+    themeMode,
+    themeLabel: THEME_LABELS[themeMode],
+    isShuttingDown,
+    onCycleTheme: () => void quickToggleTheme().catch((error: Error) => setNotice(error.message)),
+    onRefresh: () => void refreshAll().catch((error: Error) => setNotice(error.message)),
+    onShutdown: () => void shutdownWebUi().catch((error: Error) => setNotice(error.message))
+  };
+
   return (
     <MotionConfig reducedMotion="user">
       <div className="app-shell">
-        <header className="app-header panel">
-          <div className="brand-block">
-            <p className="eyebrow">Local Daemon + SPA</p>
-            <h1>Mudae WebUI</h1>
-            <p className="muted">A cleaner operational workspace for multi-account sessions, wishlists, logs, and settings.</p>
-          </div>
-          <div className="header-actions">
-            <div className="badge-row">
-              <StatusChip tone="neutral">Accounts: {totalAccounts}</StatusChip>
-              <StatusChip tone={overview?.running_count ? "success" : "neutral"} pulseKey={overview?.running_count ?? 0}>
-                Active: {overview?.running_count ?? 0}
-              </StatusChip>
-              <StatusChip tone={queuedCount ? "warning" : "neutral"} pulseKey={queuedCount}>
-                Queue: {queuedCount}
-              </StatusChip>
-              <StatusChip tone="neutral" pulseKey={themeMode}>
-                Theme: {THEME_LABELS[themeMode]}
-              </StatusChip>
-            </div>
-            <div className="button-row">
-              <button type="button" onClick={() => void quickToggleTheme().catch((error: Error) => setNotice(error.message))}>
-                Cycle Theme
-              </button>
-              <button type="button" onClick={() => void refreshAll().catch((error: Error) => setNotice(error.message))}>
-                Refresh
-              </button>
+        <AppHeader {...headerProps} />
+
+        <AnimatePresence>
+          {notice && (
+            <motion.div
+              key="toast-notice"
+              className="toast-notification-pill"
+              initial={{ opacity: 0, y: 20, scale: 0.95 }}
+              animate={{ opacity: 1, y: 0, scale: 1 }}
+              exit={{ opacity: 0, y: 15, scale: 0.95 }}
+              transition={{ duration: 0.2, ease: "easeOut" }}
+            >
+              <span className="toast-dot" />
+              <span className="toast-message">{notice}</span>
               <button
-                className="danger"
                 type="button"
-                disabled={isShuttingDown}
-                onClick={() => void shutdownWebUi().catch((error: Error) => setNotice(error.message))}
+                className="toast-close-btn"
+                onClick={() => setNotice("")}
+                aria-label="Dismiss notice"
               >
-                {isShuttingDown ? "Shutting Down..." : "Shutdown WebUI"}
+                <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5">
+                  <line x1="18" y1="6" x2="6" y2="18" />
+                  <line x1="6" y1="6" x2="18" y2="18" />
+                </svg>
               </button>
-            </div>
-          </div>
-        </header>
+            </motion.div>
+          )}
+        </AnimatePresence>
 
-        <nav className="top-tabs">
-          {TABS.map((tab) => (
-            <button key={tab} className={tab === activeTab ? "active" : ""} onClick={() => setActiveTab(tab)}>
-              {tab}
-            </button>
-          ))}
-        </nav>
-
-        <p className="notice">{notice}</p>
-
-        <AnimatePresence mode="wait" initial={false}>
+        <main className="unified-content-card">
+          <AnimatePresence mode="wait" initial={false}>
           {activeTab === "Overview" && (
             <motion.section key="overview" className="page-stack" variants={tabVariants} initial="hidden" animate="visible" exit="exit">
               <PageHeader
@@ -1164,6 +1166,7 @@ export default function App() {
             </motion.section>
           )}
         </AnimatePresence>
+        </main>
       </div>
     </MotionConfig>
   );
