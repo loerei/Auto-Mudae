@@ -74,11 +74,14 @@ from mudae.core.session_state import SessionStateEngine, SessionAction
 from mudae.core.session_dashboard import DashboardRenderer
 from mudae.core.claim_tracker import ClaimTracker
 from mudae.core.session_messaging import SessionMessageContext
+from mudae.core.session_scheduler import SessionScheduler
 
 _state_engine = SessionStateEngine()
 _dashboard_renderer = DashboardRenderer()
 _claim_tracker = ClaimTracker()
 _message_context = SessionMessageContext()
+_session_scheduler = SessionScheduler()
+
 
 def loadClaimStats() -> Dict[str, Any]:
     return _claim_tracker.load_stats()
@@ -1719,55 +1722,23 @@ def _resolve_give_target_id(pairs: List[Tuple[int, int]], source_id: int) -> Opt
 
 
 def _auto_give_hour_bucket(now_ts: float) -> str:
-    return time.strftime("%Y-%m-%d %H", time.localtime(now_ts))
-
+    return _session_scheduler.get_hour_bucket(now_ts)
 
 def _auto_give_entry_key(source_id: int, resource: str, bucket: str) -> str:
-    return f"{bucket}|{source_id}|{resource}"
-
+    return _session_scheduler.get_entry_key(source_id, resource, bucket)
 
 def _mark_auto_give_seen(*keys: str) -> None:
-    clean = [key for key in keys if key]
-    if not clean:
-        return
-    with _auto_give_seen_lock:
-        _auto_give_seen_keys.update(clean)
-
+    _session_scheduler.mark_seen(*keys)
 
 def _is_auto_give_seen(key: str) -> bool:
-    if not key:
-        return False
-    with _auto_give_seen_lock:
-        return key in _auto_give_seen_keys
-
+    return _session_scheduler.is_seen(key)
 
 def _load_auto_give_state() -> Dict[str, Any]:
-    try:
-        with open(AUTO_GIVE_STATE_FILE, 'r', encoding='utf-8') as handle:
-            payload = json.load(handle)
-    except FileNotFoundError:
-        payload = {}
-    except Exception:
-        payload = {}
-    if not isinstance(payload, dict):
-        payload = {}
-    entries = payload.get("entries")
-    if not isinstance(entries, dict):
-        payload["entries"] = {}
-    return payload
-
+    return _session_scheduler.load_state()
 
 def _save_auto_give_state(payload: Dict[str, Any]) -> None:
-    normalized = payload if isinstance(payload, dict) else {}
-    entries = normalized.get("entries")
-    if not isinstance(entries, dict):
-        normalized = dict(normalized)
-        normalized["entries"] = {}
-    os.makedirs(os.path.dirname(AUTO_GIVE_STATE_FILE), exist_ok=True)
-    temp_path = f"{AUTO_GIVE_STATE_FILE}.{os.getpid()}.{threading.get_ident()}.tmp"
-    with open(temp_path, 'w', encoding='utf-8') as handle:
-        json.dump(normalized, handle, indent=2, ensure_ascii=False)
-    os.replace(temp_path, AUTO_GIVE_STATE_FILE)
+    _session_scheduler.save_state(payload)
+
 
 
 def _build_auto_give_entry(
